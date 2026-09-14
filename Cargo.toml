@@ -1,0 +1,30 @@
+[package]
+name = "drv"
+version = "0.1.0"
+edition = "2021"
+description = "A fast CLI for managing your Google Drive"
+license = "MIT"
+repository = "https://github.com/vramdhanie/drv"
+rust-version = "1.82"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+colored = "2"
+dirs = "5"
+indicatif = "0.17"
+keyring = { version = "3", features = ["apple-native"] }
+open = "5"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+urlencoding = "2"
+
+[profile.release]
+lto = true
+strip = true

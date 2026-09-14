@@ -1,7 +1,11 @@
 mod auth;
+mod claude;
 mod commands;
 mod config;
 mod drive;
+mod embed;
+mod extract;
+mod store;
 mod ui;
 
 use clap::builder::styling::{AnsiColor, Styles};
@@ -20,9 +24,14 @@ fn styles() -> Styles {
 ///
 /// Files and folders are addressed by path ("Projects/Notes/todo.txt").
 /// Prefix with "id:" to address by raw Drive file ID instead.
+/// Multiple Google accounts are supported: see `drv account` and --account.
 #[derive(Parser)]
 #[command(name = "drv", version, about, styles = styles(), arg_required_else_help = true)]
 struct Cli {
+    /// Act on a specific account (default: the active account)
+    #[arg(short, long, global = true)]
+    account: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -33,6 +42,11 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// List and switch between signed-in Google accounts
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
     },
     /// List files in a folder (root by default)
     Ls {
@@ -86,25 +100,42 @@ enum Command {
         #[arg(long, short)]
         out: Option<std::path::PathBuf>,
     },
-    /// Build the local semantic index (coming in v0.2)
+    /// Build or refresh the local semantic index of your Drive's contents
+    ///
+    /// First run crawls your Drive's metadata and embeds the text of docs,
+    /// sheets, slides, PDFs, and text files with a local model (downloaded
+    /// once, runs entirely on-device). Later runs are incremental via the
+    /// Drive changes feed.
     Index,
-    /// Search your Drive semantically (coming in v0.2)
+    /// Semantic search across your indexed Drive
     Search {
-        /// What to look for
-        #[allow(dead_code)]
+        /// What to look for (natural language)
+        #[arg(required = true)]
         query: Vec<String>,
+        /// Only search within this folder (path or "id:<fileId>")
+        #[arg(long = "in")]
+        folder: Option<String>,
+        /// Maximum results
+        #[arg(short = 'n', long, default_value_t = 8)]
+        limit: usize,
     },
-    /// Ask Claude about the contents of a folder (coming in v0.2)
+    /// Ask Claude a question, answered from your indexed files
     Prompt {
         /// What to ask
-        #[allow(dead_code)]
+        #[arg(required = true)]
         question: Vec<String>,
+        /// Only draw on files within this folder (path or "id:<fileId>")
+        #[arg(long = "in")]
+        folder: Option<String>,
+        /// Claude model to use
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum AuthCommand {
-    /// Sign in to Google (opens your browser)
+    /// Sign in to Google (opens your browser); repeat for more accounts
     Login {
         /// Use your own OAuth client ID instead of the built-in one
         #[arg(long, requires = "client_secret")]
@@ -112,41 +143,62 @@ enum AuthCommand {
         /// OAuth client secret matching --client-id
         #[arg(long, requires = "client_id")]
         client_secret: Option<String>,
+        /// Alias to store this account under (default: its email address)
+        #[arg(long = "as")]
+        alias: Option<String>,
     },
-    /// Show the signed-in account and storage usage
+    /// Show signed-in accounts and storage usage
     Status,
-    /// Remove stored Google credentials
+    /// Remove stored Google credentials for the selected account
     Logout,
-    /// Store an Anthropic API key (used by search/prompt in v0.2)
+    /// Store an Anthropic API key (used by search/prompt)
     Claude,
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// List signed-in accounts (● marks the active one)
+    List,
+    /// Set the account used when --account isn't given
+    Use {
+        /// Account alias (see `drv account list`)
+        alias: String,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
+    let account = cli.account.as_deref();
     let result = match cli.command {
         Command::Auth { command } => match command {
-            AuthCommand::Login { client_id, client_secret } => {
-                commands::auth_login(client_id, client_secret)
+            AuthCommand::Login { client_id, client_secret, alias } => {
+                commands::auth_login(client_id, client_secret, alias)
             }
-            AuthCommand::Status => commands::auth_status(),
-            AuthCommand::Logout => commands::auth_logout(),
+            AuthCommand::Status => commands::auth_status(account),
+            AuthCommand::Logout => commands::auth_logout(account),
             AuthCommand::Claude => commands::auth_claude(),
         },
-        Command::Ls { path, recursive, long } => commands::ls(path.as_deref(), recursive, long),
+        Command::Account { command } => match command {
+            AccountCommand::List => commands::account_list(),
+            AccountCommand::Use { alias } => commands::account_use(&alias),
+        },
+        Command::Ls { path, recursive, long } => {
+            commands::ls(account, path.as_deref(), recursive, long)
+        }
         Command::Share { path, email, role, notify } => {
-            commands::share(&path, &email, &role, notify)
+            commands::share(account, &path, &email, &role, notify)
         }
         Command::Cp { path, new_name, to } => {
-            commands::cp(&path, new_name.as_deref(), to.as_deref())
+            commands::cp(account, &path, new_name.as_deref(), to.as_deref())
         }
-        Command::Upload { files, to } => commands::upload(&files, to.as_deref()),
-        Command::Download { paths, out } => commands::download(&paths, out.as_deref()),
-        Command::Index | Command::Search { .. } | Command::Prompt { .. } => {
-            println!(
-                "{} this command ships in v0.2 (local semantic index + Claude).",
-                "coming soon:".yellow().bold()
-            );
-            Ok(())
+        Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),
+        Command::Download { paths, out } => commands::download(account, &paths, out.as_deref()),
+        Command::Index => commands::index(account),
+        Command::Search { query, folder, limit } => {
+            commands::search(account, &query.join(" "), folder.as_deref(), limit)
+        }
+        Command::Prompt { question, folder, model } => {
+            commands::prompt(account, &question.join(" "), folder.as_deref(), model.as_deref())
         }
     };
 

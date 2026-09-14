@@ -9,6 +9,9 @@ const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
+/// (fileId, None) means the file was removed; Some carries the new state.
+pub type FileChange = (String, Option<DriveFile>);
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveFile {
@@ -19,6 +22,10 @@ pub struct DriveFile {
     pub size: Option<String>,
     #[serde(default)]
     pub modified_time: Option<String>,
+    #[serde(default)]
+    pub parents: Option<Vec<String>>,
+    #[serde(default)]
+    pub web_view_link: Option<String>,
 }
 
 impl DriveFile {
@@ -45,13 +52,20 @@ pub struct Drive {
 }
 
 const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime";
+const INDEX_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLink";
 
 impl Drive {
-    pub fn connect() -> Result<Self> {
-        Ok(Self {
+    pub fn connect(account: &str) -> Result<Self> {
+        Ok(Self::with_token(auth::access_token(account)?))
+    }
+
+    /// Build a client from a raw access token (used right after login,
+    /// before the account has a stored alias).
+    pub fn with_token(token: String) -> Self {
+        Self {
             http: reqwest::blocking::Client::new(),
-            token: auth::access_token()?,
-        })
+            token,
+        }
     }
 
     fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
@@ -219,6 +233,121 @@ impl Drive {
         } else {
             let resp = self.get(&format!("{API}/files/{}", file.id), &[("alt", "media")])?;
             Ok((resp, None))
+        }
+    }
+
+    /// Every non-trashed file in My Drive, with the fields the index needs.
+    /// The callback receives each page so huge drives don't buffer entirely.
+    pub fn list_all(&self, mut on_page: impl FnMut(Vec<DriveFile>)) -> Result<usize> {
+        let fields = format!("nextPageToken,files({INDEX_FIELDS})");
+        let mut total = 0;
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query = vec![
+                ("q", "trashed = false"),
+                ("fields", fields.as_str()),
+                ("pageSize", "1000"),
+            ];
+            if let Some(token) = page_token.as_deref() {
+                query.push(("pageToken", token));
+            }
+            let page: FileList = self.get(&format!("{API}/files"), &query)?.json()?;
+            total += page.files.len();
+            on_page(page.files);
+            match page.next_page_token {
+                Some(t) => page_token = Some(t),
+                None => return Ok(total),
+            }
+        }
+    }
+
+    /// Cursor for the changes feed — fetch BEFORE a full crawl so nothing
+    /// that changes mid-crawl is missed.
+    pub fn changes_start_token(&self) -> Result<String> {
+        let v: serde_json::Value = self
+            .get(&format!("{API}/changes/startPageToken"), &[])?
+            .json()?;
+        v["startPageToken"]
+            .as_str()
+            .map(String::from)
+            .context("missing startPageToken")
+    }
+
+    /// Everything changed since `token`. Returns (changes, newStartToken):
+    /// each change is (fileId, None) for a removal or (fileId, Some(file)).
+    pub fn changes_since(&self, token: &str) -> Result<(Vec<FileChange>, String)> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Change {
+            file_id: String,
+            #[serde(default)]
+            removed: bool,
+            #[serde(default)]
+            file: Option<DriveFile>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ChangeList {
+            #[serde(default)]
+            changes: Vec<Change>,
+            next_page_token: Option<String>,
+            new_start_page_token: Option<String>,
+        }
+        let fields = format!(
+            "nextPageToken,newStartPageToken,changes(fileId,removed,file({INDEX_FIELDS},trashed))"
+        );
+        let mut out = Vec::new();
+        let mut cursor = token.to_string();
+        loop {
+            let page: ChangeList = self
+                .get(
+                    &format!("{API}/changes"),
+                    &[
+                        ("pageToken", cursor.as_str()),
+                        ("fields", fields.as_str()),
+                        ("pageSize", "1000"),
+                    ],
+                )?
+                .json()?;
+            for c in page.changes {
+                if c.removed || c.file.is_none() {
+                    out.push((c.file_id, None));
+                } else {
+                    out.push((c.file_id, c.file));
+                }
+            }
+            if let Some(next) = page.next_page_token {
+                cursor = next;
+            } else {
+                let new_start = page
+                    .new_start_page_token
+                    .context("changes feed missing newStartPageToken")?;
+                return Ok((out, new_start));
+            }
+        }
+    }
+
+    /// Export a Google-native file as plain text (or CSV for Sheets).
+    pub fn export_text(&self, id: &str, export_mime: &str) -> Result<String> {
+        Ok(self
+            .get(&format!("{API}/files/{id}/export"), &[("mimeType", export_mime)])?
+            .text()?)
+    }
+
+    /// Download a regular file's bytes, refusing anything over `cap` bytes.
+    pub fn download_bytes(&self, id: &str, cap: u64) -> Result<Vec<u8>> {
+        let mut resp = self.get(&format!("{API}/files/{id}"), &[("alt", "media")])?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut resp, &mut chunk)?;
+            if n == 0 {
+                return Ok(buf);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() as u64 > cap {
+                bail!("file exceeds {cap} byte extraction cap");
+            }
         }
     }
 

@@ -80,8 +80,35 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
-/// Run the browser PKCE flow, store the refresh token, return nothing.
-pub fn login(client: &ClientCreds) -> Result<()> {
+fn token_entry(account: &str) -> String {
+    format!("google-refresh-token:{account}")
+}
+
+/// v0.1 stored a single token under "google-refresh-token"; adopt it as the
+/// account alias "default" so upgrades keep working. Returns the alias if a
+/// migration happened.
+pub fn migrate_legacy() -> Result<Option<String>> {
+    if let Some(token) = keychain_get("google-refresh-token")? {
+        keychain_set(&token_entry("default"), &token)?;
+        keychain_delete("google-refresh-token")?;
+        crate::config::register_account("default")?;
+        return Ok(Some("default".into()));
+    }
+    Ok(None)
+}
+
+pub fn store_refresh(account: &str, refresh: &str) -> Result<()> {
+    keychain_set(&token_entry(account), refresh)
+}
+
+
+pub fn forget_account(account: &str) -> Result<()> {
+    keychain_delete(&token_entry(account))
+}
+
+/// Run the browser PKCE flow. Returns (refresh_token, access_token) so the
+/// caller can identify the account before deciding what to store it under.
+pub fn login(client: &ClientCreds) -> Result<(String, String)> {
     // PKCE verifier + challenge
     let mut bytes = [0u8; 64];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -126,11 +153,7 @@ pub fn login(client: &ClientCreds) -> Result<()> {
     let refresh = resp
         .refresh_token
         .context("Google did not return a refresh token (try revoking access at myaccount.google.com/permissions and logging in again)")?;
-    keychain_set("google-refresh-token", &refresh)?;
-    // A token is valid right now too; hand it back via keychain-free path is
-    // unnecessary — commands fetch a fresh one on demand.
-    let _ = resp.access_token;
-    Ok(())
+    Ok((refresh, resp.access_token))
 }
 
 /// Block until the loopback server receives the OAuth redirect.
@@ -177,10 +200,10 @@ fn wait_for_code(listener: &TcpListener) -> Result<String> {
     bail!("loopback listener closed unexpectedly")
 }
 
-/// Exchange the stored refresh token for a fresh access token.
-pub fn access_token() -> Result<String> {
-    let refresh = keychain_get("google-refresh-token")?.context(format!(
-        "not signed in — run {} first",
+/// Exchange the stored refresh token of an account for a fresh access token.
+pub fn access_token(account: &str) -> Result<String> {
+    let refresh = keychain_get(&token_entry(account))?.context(format!(
+        "account '{account}' has no stored credentials — run {}",
         "drv auth login".green()
     ))?;
     let client = resolve_client()?;

@@ -4,13 +4,35 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::auth::{self, ClientCreds};
+use crate::claude;
 use crate::config;
 use crate::drive::{Drive, DriveFile};
+use crate::embed::Embedder;
+use crate::extract;
+use crate::store::Store;
 use crate::ui;
+
+/// Resolve which account this invocation acts on (after any v0.1 migration).
+fn account_for(flag: Option<&str>) -> Result<String> {
+    if let Some(alias) = auth::migrate_legacy()? {
+        eprintln!("{} adopted v0.1 credentials as account '{alias}'", "note:".yellow());
+    }
+    config::resolve_account(flag)
+}
+
+fn connect(flag: Option<&str>) -> Result<(String, Drive)> {
+    let account = account_for(flag)?;
+    let drive = Drive::connect(&account)?;
+    Ok((account, drive))
+}
 
 // ---------- auth ----------
 
-pub fn auth_login(client_id: Option<String>, client_secret: Option<String>) -> Result<()> {
+pub fn auth_login(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    alias: Option<String>,
+) -> Result<()> {
     let creds = if let (Some(id), Some(secret)) = (client_id, client_secret) {
         // Bring-your-own client: persist it for future runs.
         let mut cfg = config::load()?;
@@ -23,56 +45,88 @@ pub fn auth_login(client_id: Option<String>, client_secret: Option<String>) -> R
         auth::resolve_client()?
     };
 
-    auth::login(&creds)?;
-    println!("{} signed in to Google.", "✓".green().bold());
+    let (refresh, access) = auth::login(&creds)?;
 
-    let drive = Drive::connect()?;
+    // Identify the account so it can be stored under a sensible alias.
+    let drive = Drive::with_token(access);
     let about = drive.about()?;
-    if let Some(email) = about["user"]["emailAddress"].as_str() {
-        println!("  account: {}", email.bold());
+    let email = about["user"]["emailAddress"].as_str().unwrap_or("unknown").to_string();
+    let alias = alias.unwrap_or_else(|| email.clone());
+
+    auth::store_refresh(&alias, &refresh)?;
+    config::register_account(&alias)?;
+    println!("{} signed in as {} (account alias: {})", "✓".green().bold(), email.bold(), alias.bold());
+    let active = config::load()?.active_account;
+    if active.as_deref() != Some(alias.as_str()) {
+        println!(
+            "  (active account is still {}; switch with {})",
+            active.unwrap_or_default(),
+            format!("drv account use {alias}").green()
+        );
     }
     Ok(())
 }
 
-pub fn auth_status() -> Result<()> {
-    if auth::keychain_get("google-refresh-token")?.is_none() {
+pub fn auth_status(flag: Option<&str>) -> Result<()> {
+    let _ = auth::migrate_legacy()?;
+    let cfg = config::load()?;
+    if cfg.accounts.is_empty() {
         println!("{} not signed in — run {}.", "✗".red(), "drv auth login".green());
     } else {
-        let drive = Drive::connect()?;
-        let about = drive.about()?;
-        let user = &about["user"];
-        println!(
-            "{} signed in as {} <{}>",
-            "✓".green().bold(),
-            user["displayName"].as_str().unwrap_or("?").bold(),
-            user["emailAddress"].as_str().unwrap_or("?"),
-        );
-        let quota = &about["storageQuota"];
-        if let (Some(usage), Some(limit)) = (
-            quota["usage"].as_str().and_then(|s| s.parse::<u64>().ok()),
-            quota["limit"].as_str().and_then(|s| s.parse::<u64>().ok()),
-        ) {
-            println!(
-                "  storage: {} of {} used",
-                ui::human_size(usage),
-                ui::human_size(limit)
-            );
+        for alias in &cfg.accounts {
+            // With a flag, only report that one account.
+            if flag.is_some() && flag != Some(alias.as_str()) {
+                continue;
+            }
+            let active = cfg.active_account.as_deref() == Some(alias.as_str());
+            match Drive::connect(alias).and_then(|d| d.about()) {
+                Ok(about) => {
+                    let user = &about["user"];
+                    let quota = &about["storageQuota"];
+                    let storage = match (
+                        quota["usage"].as_str().and_then(|s| s.parse::<u64>().ok()),
+                        quota["limit"].as_str().and_then(|s| s.parse::<u64>().ok()),
+                    ) {
+                        (Some(u), Some(l)) => {
+                            format!(", {} of {} used", ui::human_size(u), ui::human_size(l))
+                        }
+                        _ => String::new(),
+                    };
+                    println!(
+                        "{} {}{} — {} <{}>{}",
+                        "✓".green().bold(),
+                        alias.bold(),
+                        if active { " (active)".green().to_string() } else { String::new() },
+                        user["displayName"].as_str().unwrap_or("?"),
+                        user["emailAddress"].as_str().unwrap_or("?"),
+                        storage,
+                    );
+                }
+                Err(e) => println!("{} {} — {e:#}", "✗".red(), alias.bold()),
+            }
         }
     }
-    let claude = auth::keychain_get("anthropic-api-key")?.is_some();
+    let claude_key = auth::keychain_get("anthropic-api-key")?.is_some();
     println!(
         "{} Claude API key {}",
-        if claude { "✓".green().bold() } else { "○".dimmed() },
-        if claude { "stored (used by v0.2 search/prompt)".into() } else {
+        if claude_key { "✓".green().bold() } else { "○".dimmed() },
+        if claude_key { "stored (used by search/prompt)".into() } else {
             format!("not set — optional, add with {}", "drv auth claude".green())
         }
     );
     Ok(())
 }
 
-pub fn auth_logout() -> Result<()> {
-    auth::keychain_delete("google-refresh-token")?;
-    println!("{} Google credentials removed from the Keychain.", "✓".green().bold());
+pub fn auth_logout(flag: Option<&str>) -> Result<()> {
+    let account = account_for(flag)?;
+    auth::forget_account(&account)?;
+    let mut cfg = config::load()?;
+    cfg.accounts.retain(|a| a != &account);
+    if cfg.active_account.as_deref() == Some(account.as_str()) {
+        cfg.active_account = cfg.accounts.first().cloned();
+    }
+    config::save(&cfg)?;
+    println!("{} removed credentials for {}.", "✓".green().bold(), account.bold());
     println!(
         "  (To fully revoke access: {})",
         "myaccount.google.com/permissions".underline()
@@ -95,10 +149,44 @@ pub fn auth_claude() -> Result<()> {
     Ok(())
 }
 
+// ---------- account ----------
+
+pub fn account_list() -> Result<()> {
+    let _ = auth::migrate_legacy()?;
+    let cfg = config::load()?;
+    if cfg.accounts.is_empty() {
+        println!("No accounts — run {}.", "drv auth login".green());
+        return Ok(());
+    }
+    for alias in &cfg.accounts {
+        let marker = if cfg.active_account.as_deref() == Some(alias.as_str()) {
+            "●".green().to_string()
+        } else {
+            "○".dimmed().to_string()
+        };
+        println!("{marker} {alias}");
+    }
+    Ok(())
+}
+
+pub fn account_use(alias: &str) -> Result<()> {
+    let mut cfg = config::load()?;
+    if !cfg.accounts.iter().any(|a| a == alias) {
+        bail!(
+            "unknown account '{alias}' — known: {}",
+            if cfg.accounts.is_empty() { "(none)".into() } else { cfg.accounts.join(", ") }
+        );
+    }
+    cfg.active_account = Some(alias.to_string());
+    config::save(&cfg)?;
+    println!("{} active account is now {}.", "✓".green().bold(), alias.bold());
+    Ok(())
+}
+
 // ---------- ls ----------
 
-pub fn ls(path: Option<&str>, recursive: bool, long: bool) -> Result<()> {
-    let drive = Drive::connect()?;
+pub fn ls(account: Option<&str>, path: Option<&str>, recursive: bool, long: bool) -> Result<()> {
+    let (_, drive) = connect(account)?;
     let target = drive.resolve(path.unwrap_or(""))?;
     if !target.is_folder() {
         print_entry(&target, long, 0);
@@ -155,14 +243,14 @@ fn print_entry(file: &DriveFile, long: bool, depth: usize) {
 
 // ---------- share ----------
 
-pub fn share(path: &str, email: &str, role: &str, notify: bool) -> Result<()> {
+pub fn share(account: Option<&str>, path: &str, email: &str, role: &str, notify: bool) -> Result<()> {
     let api_role = match role {
         "viewer" => "reader",
         "commenter" => "commenter",
         "editor" => "writer",
         other => bail!("unknown role '{other}'"),
     };
-    let drive = Drive::connect()?;
+    let (_, drive) = connect(account)?;
     let file = drive.resolve(path)?;
     drive.share(&file.id, email, api_role, notify)?;
     println!(
@@ -178,8 +266,8 @@ pub fn share(path: &str, email: &str, role: &str, notify: bool) -> Result<()> {
 
 // ---------- cp ----------
 
-pub fn cp(path: &str, new_name: Option<&str>, to: Option<&str>) -> Result<()> {
-    let drive = Drive::connect()?;
+pub fn cp(account: Option<&str>, path: &str, new_name: Option<&str>, to: Option<&str>) -> Result<()> {
+    let (_, drive) = connect(account)?;
     let source = drive.resolve(path)?;
     if source.is_folder() {
         bail!("Drive cannot server-side copy folders — copy individual files, or download and re-upload");
@@ -207,8 +295,8 @@ pub fn cp(path: &str, new_name: Option<&str>, to: Option<&str>) -> Result<()> {
 
 // ---------- upload ----------
 
-pub fn upload(files: &[PathBuf], to: Option<&str>) -> Result<()> {
-    let drive = Drive::connect()?;
+pub fn upload(account: Option<&str>, files: &[PathBuf], to: Option<&str>) -> Result<()> {
+    let (_, drive) = connect(account)?;
     let parent = match to {
         Some(dest) => {
             let folder = drive.resolve(dest)?;
@@ -279,8 +367,8 @@ fn guess_mime(path: &Path) -> &'static str {
 
 // ---------- download ----------
 
-pub fn download(paths: &[String], out: Option<&Path>) -> Result<()> {
-    let drive = Drive::connect()?;
+pub fn download(account: Option<&str>, paths: &[String], out: Option<&Path>) -> Result<()> {
+    let (_, drive) = connect(account)?;
     let out_dir = out.unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating {}", out_dir.display()))?;
@@ -300,10 +388,7 @@ pub fn download(paths: &[String], out: Option<&Path>) -> Result<()> {
         }
         let dest = out_dir.join(&file_name);
 
-        let len = resp
-            .content_length()
-            .or(file.size_bytes())
-            .unwrap_or(0);
+        let len = resp.content_length().or(file.size_bytes()).unwrap_or(0);
         let bar = ui::transfer_bar(len, &file_name);
         let mut writer = std::fs::File::create(&dest)
             .with_context(|| format!("creating {}", dest.display()))?;
@@ -324,6 +409,210 @@ pub fn download(paths: &[String], out: Option<&Path>) -> Result<()> {
             dest.display().to_string().bold(),
             exported
         );
+    }
+    Ok(())
+}
+
+// ---------- index ----------
+
+pub fn index(account: Option<&str>) -> Result<()> {
+    let (account, drive) = connect(account)?;
+    let mut store = Store::open(&account)?;
+
+    // Sync metadata: incremental via the changes feed when we have a cursor,
+    // full crawl otherwise. Grab the next cursor BEFORE crawling so changes
+    // made mid-crawl aren't lost.
+    match store.meta_get("changes_token")? {
+        Some(token) => {
+            let (changes, new_token) = drive.changes_since(&token)?;
+            let count = changes.len();
+            for (file_id, file) in changes {
+                match file {
+                    Some(f) => store.upsert_file(&f)?,
+                    None => store.remove_file(&file_id)?,
+                }
+            }
+            store.meta_set("changes_token", &new_token)?;
+            println!("synced {count} change(s) from Drive");
+        }
+        None => {
+            let next_token = drive.changes_start_token()?;
+            let root = drive.get_file("root")?;
+            store.meta_set("root_id", &root.id)?;
+            println!("first run — crawling your Drive's metadata…");
+            let total = drive.list_all(|page| {
+                for f in &page {
+                    let _ = store.upsert_file(f);
+                }
+            })?;
+            store.meta_set("changes_token", &next_token)?;
+            println!("catalogued {total} files");
+        }
+    }
+
+    // Extract + embed whatever is stale.
+    let stale = store.stale_files(extract::indexable)?;
+    if stale.is_empty() {
+        let (files, chunks) = store.stats()?;
+        println!(
+            "{} index up to date ({files} files catalogued, {chunks} chunks embedded)",
+            "✓".green().bold()
+        );
+        return Ok(());
+    }
+
+    println!("indexing content of {} file(s)…", stale.len());
+    let mut embedder = Embedder::load()?;
+    let bar = indicatif::ProgressBar::new(stale.len() as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("{msg:30!} [{bar:30.green}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    let mut embedded = 0usize;
+    let mut skipped = 0usize;
+    for (id, name, mime) in &stale {
+        bar.set_message(name.clone());
+        let size = store.file_meta(id)?.and_then(|(_, s)| s);
+        match extract::text_of(&drive, id, mime, size) {
+            Ok(Some(text)) => {
+                let chunks = extract::chunk(&text);
+                let embeddings = embedder.embed_documents(&chunks)?;
+                let rows: Vec<(String, Vec<u8>)> = chunks
+                    .into_iter()
+                    .zip(embeddings.iter().map(|e| crate::embed::to_blob(e)))
+                    .collect();
+                store.set_chunks(id, &rows)?;
+                embedded += 1;
+            }
+            Ok(None) => {
+                store.mark_extracted(id)?;
+                skipped += 1;
+            }
+            Err(e) => {
+                bar.println(format!("{} {name}: {e:#}", "skip".yellow()));
+                store.mark_extracted(id)?;
+                skipped += 1;
+            }
+        }
+        bar.inc(1);
+    }
+    bar.finish_and_clear();
+    let (files, chunks) = store.stats()?;
+    println!(
+        "{} indexed {embedded} file(s), skipped {skipped} — {files} files catalogued, {chunks} chunks embedded",
+        "✓".green().bold()
+    );
+    Ok(())
+}
+
+// ---------- search ----------
+
+pub fn search(account: Option<&str>, query: &str, folder: Option<&str>, limit: usize) -> Result<()> {
+    let account = account_for(account)?;
+    let store = Store::open(&account)?;
+    let (_, chunks) = store.stats()?;
+    if chunks == 0 {
+        bail!("the index is empty — run {} first", "drv index".green());
+    }
+
+    let scope = match folder {
+        Some(path) => Some(store.resolve_folder(path).and_then(|id| store.descendants(&id))?),
+        None => None,
+    };
+
+    let mut embedder = Embedder::load()?;
+    let query_emb = embedder.embed_query(query)?;
+    let hits = store.search(&query_emb, scope.as_ref(), limit * 3)?;
+
+    // Show each file once, at its best-scoring chunk.
+    let mut seen = std::collections::HashSet::new();
+    let mut shown = 0;
+    for hit in hits {
+        if !seen.insert(hit.file_id.clone()) || shown >= limit {
+            continue;
+        }
+        let (name, link) = store
+            .file_info(&hit.file_id)?
+            .unwrap_or((hit.file_id.clone(), None));
+        let path = store.path_of(&hit.file_id).unwrap_or_else(|_| name.clone());
+        let snippet: String = hit.text.chars().take(180).collect::<String>().replace('\n', " ");
+        println!(
+            "{:.2}  {}  {}",
+            hit.score,
+            path.bold(),
+            format!("id:{}", hit.file_id).dimmed()
+        );
+        println!("      {}", snippet.dimmed());
+        if let Some(link) = link {
+            println!("      {}", link.blue().underline());
+        }
+        shown += 1;
+    }
+    if shown == 0 {
+        println!("{}", "no matches".dimmed());
+    }
+    Ok(())
+}
+
+// ---------- prompt ----------
+
+pub fn prompt(
+    account: Option<&str>,
+    question: &str,
+    folder: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    let account = account_for(account)?;
+    let store = Store::open(&account)?;
+    let (_, chunk_count) = store.stats()?;
+    if chunk_count == 0 {
+        bail!("the index is empty — run {} first", "drv index".green());
+    }
+
+    let scope = match folder {
+        Some(path) => Some(store.resolve_folder(path).and_then(|id| store.descendants(&id))?),
+        None => None,
+    };
+
+    let mut embedder = Embedder::load()?;
+    let query_emb = embedder.embed_query(question)?;
+    let hits = store.search(&query_emb, scope.as_ref(), 12)?;
+    if hits.is_empty() {
+        bail!("nothing relevant found in the index for that question");
+    }
+
+    // Number the excerpts and remember which file each came from.
+    let mut sources: Vec<(String, Option<String>)> = Vec::new();
+    let mut excerpts = String::new();
+    for (i, hit) in hits.iter().enumerate() {
+        let (name, link) = store
+            .file_info(&hit.file_id)?
+            .unwrap_or((hit.file_id.clone(), None));
+        let path = store.path_of(&hit.file_id).unwrap_or_else(|_| name.clone());
+        excerpts.push_str(&format!("[{}] {path}\n{}\n\n", i + 1, hit.text));
+        sources.push((path, link));
+    }
+
+    let system = "You answer questions about the user's Google Drive files. \
+        Base your answer only on the numbered excerpts provided. Cite excerpts \
+        inline as [n]. If the excerpts don't contain the answer, say so plainly. \
+        Be concise.";
+    let user = format!("Question: {question}\n\nExcerpts from my files:\n\n{excerpts}");
+
+    eprintln!("{}", "asking Claude…".dimmed());
+    let answer = claude::ask(system, &user, model)?;
+    println!("{answer}\n");
+    println!("{}", "sources:".dimmed());
+    let mut listed = std::collections::HashSet::new();
+    for (i, (path, link)) in sources.iter().enumerate() {
+        if !listed.insert(path.clone()) {
+            continue;
+        }
+        match link {
+            Some(link) => println!("  [{}] {} — {}", i + 1, path, link.blue().underline()),
+            None => println!("  [{}] {}", i + 1, path),
+        }
     }
     Ok(())
 }

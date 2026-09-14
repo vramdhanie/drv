@@ -799,6 +799,7 @@ dependencies = [
  "fastembed",
  "indicatif 0.17.11",
  "keyring",
+ "libc",
  "open",
  "pdf-extract",
  "rand 0.8.8",

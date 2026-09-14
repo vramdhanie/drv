@@ -167,6 +167,11 @@ enum AccountCommand {
 }
 
 fn main() {
+    // Die quietly when downstream closes the pipe (`drv ls | head`), like
+    // every other Unix CLI, instead of panicking on Broken pipe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let account = cli.account.as_deref();
     let result = match cli.command {

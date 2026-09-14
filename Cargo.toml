@@ -16,6 +16,7 @@ dirs = "5"
 fastembed = "6.1.0"
 indicatif = "0.17"
 keyring = { version = "3", features = ["apple-native"] }
+libc = "0.2.189"
 open = "5"
 pdf-extract = "0.12.0"
 rand = "0.8"

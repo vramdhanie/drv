@@ -48,7 +48,10 @@ struct FileList {
 
 pub struct Drive {
     http: reqwest::blocking::Client,
-    token: String,
+    /// Access tokens live ~1 hour; long crawls outlive them, so GETs
+    /// refresh and retry once on 401 (needs `account` to be set).
+    token: std::cell::RefCell<String>,
+    account: Option<String>,
 }
 
 const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime";
@@ -56,27 +59,43 @@ const INDEX_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLi
 
 impl Drive {
     pub fn connect(account: &str) -> Result<Self> {
-        Ok(Self::with_token(auth::access_token(account)?))
+        let mut drive = Self::with_token(auth::access_token(account)?);
+        drive.account = Some(account.to_string());
+        Ok(drive)
     }
 
     /// Build a client from a raw access token (used right after login,
-    /// before the account has a stored alias).
+    /// before the account has a stored alias). No 401-refresh possible.
     pub fn with_token(token: String) -> Self {
         Self {
             http: reqwest::blocking::Client::new(),
-            token,
+            token: std::cell::RefCell::new(token),
+            account: None,
         }
     }
 
+    fn bearer(&self) -> String {
+        self.token.borrow().clone()
+    }
+
     fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
-            .query(query)
-            .send()
-            .with_context(|| format!("GET {url}"))?;
-        check(resp)
+        for attempt in 0..2 {
+            let resp = self
+                .http
+                .get(url)
+                .bearer_auth(self.bearer())
+                .query(query)
+                .send()
+                .with_context(|| format!("GET {url}"))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                if let Some(account) = &self.account {
+                    *self.token.borrow_mut() = auth::access_token(account)?;
+                    continue;
+                }
+            }
+            return check(resp);
+        }
+        unreachable!("retry loop always returns")
     }
 
     /// All (non-trashed) children of a folder, every page.
@@ -149,7 +168,7 @@ impl Drive {
         let resp = self
             .http
             .post(format!("{API}/files/{file_id}/permissions"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer())
             .query(&[("sendNotificationEmail", if notify { "true" } else { "false" })])
             .json(&json!({ "type": "user", "role": role, "emailAddress": email }))
             .send()
@@ -169,7 +188,7 @@ impl Drive {
         let resp = self
             .http
             .post(format!("{API}/files/{file_id}/copy"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer())
             .query(&[("fields", FILE_FIELDS)])
             .json(&serde_json::Value::Object(body))
             .send()
@@ -194,7 +213,7 @@ impl Drive {
         let init = self
             .http
             .post(format!("{UPLOAD_API}/files"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer())
             .query(&[("uploadType", "resumable"), ("fields", FILE_FIELDS)])
             .header("X-Upload-Content-Type", content_type)
             .header("X-Upload-Content-Length", len.to_string())

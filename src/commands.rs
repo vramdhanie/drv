@@ -108,11 +108,16 @@ pub fn auth_status(flag: Option<&str>) -> Result<()> {
         }
     }
     let claude_key = secrets.anthropic_api_key.is_some();
+    let claude_cli = !claude_key && claude::claude_cli_available();
     println!(
-        "{} Claude API key {}",
-        if claude_key { "✓".green().bold() } else { "○".dimmed() },
-        if claude_key { "stored (used by search/prompt)".into() } else {
-            format!("not set — optional, add with {}", "drv auth claude".green())
+        "{} Claude {}",
+        if claude_key || claude_cli { "✓".green().bold() } else { "○".dimmed() },
+        if claude_key {
+            "API key stored (used by prompt)".into()
+        } else if claude_cli {
+            "via your local Claude Code CLI (no API key needed)".into()
+        } else {
+            format!("not available — add a key with {} or install Claude Code", "drv auth claude".green())
         }
     );
     Ok(())
@@ -259,26 +264,24 @@ pub fn browse(account: Option<&str>) -> Result<()> {
         let (current_id, _) = stack.last().cloned().unwrap();
         let children = drive.list_children(&current_id)?;
 
+        enum Entry {
+            Up,
+            Multi,
+            Item(usize),
+        }
+        let mut entries: Vec<Entry> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         if stack.len() > 1 {
+            entries.push(Entry::Up);
             labels.push("⬑ ..".into());
         }
-        for f in &children {
-            let icon = if f.is_folder() {
-                "📁"
-            } else if f.is_shortcut() {
-                "🔗"
-            } else {
-                "· "
-            };
-            let mut label = format!("{icon} {}", f.name);
-            if f.is_shortcut() {
-                label.push_str("  (link — not stored here)");
-            }
-            if f.shared == Some(true) {
-                label.push_str("  (shared)");
-            }
-            labels.push(label);
+        if !children.is_empty() {
+            entries.push(Entry::Multi);
+            labels.push("☑ select multiple…".into());
+        }
+        for (i, f) in children.iter().enumerate() {
+            entries.push(Entry::Item(i));
+            labels.push(item_label(f));
         }
         if labels.is_empty() {
             println!("{}", "(empty folder)".dimmed());
@@ -306,12 +309,17 @@ pub fn browse(account: Option<&str>) -> Result<()> {
             return Ok(()); // Esc
         };
 
-        let has_up = stack.len() > 1;
-        if has_up && picked == 0 {
-            stack.pop();
-            continue;
-        }
-        let file = &children[picked - usize::from(has_up)];
+        let file = match entries[picked] {
+            Entry::Up => {
+                stack.pop();
+                continue;
+            }
+            Entry::Multi => {
+                multi_select_action(&drive, &children)?;
+                continue;
+            }
+            Entry::Item(i) => &children[i],
+        };
 
         if file.is_folder() {
             stack.push((file.id.clone(), file.name.clone()));
@@ -346,6 +354,154 @@ pub fn browse(account: Option<&str>) -> Result<()> {
             }
             println!("  {} id:{}\n", "id:".dimmed(), shown.id);
         }
+    }
+}
+
+fn item_label(f: &DriveFile) -> String {
+    let icon = if f.is_folder() {
+        "📁"
+    } else if f.is_shortcut() {
+        "🔗"
+    } else {
+        "· "
+    };
+    let mut label = format!("{icon} {}", f.name);
+    if f.is_shortcut() {
+        label.push_str("  (link — not stored here)");
+    }
+    if f.shared == Some(true) {
+        label.push_str("  (shared)");
+    }
+    label
+}
+
+/// Tick items in the current folder, pick an action, run it on all of them.
+fn multi_select_action(drive: &Drive, children: &[DriveFile]) -> Result<()> {
+    let labels: Vec<String> = children.iter().map(item_label).collect();
+    let Some(picked) = dialoguer::MultiSelect::new()
+        .with_prompt("Space to tick, Enter to confirm, Esc to cancel")
+        .items(&labels)
+        .max_length(20)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    if picked.is_empty() {
+        return Ok(());
+    }
+    let selection: Vec<&DriveFile> = picked.iter().map(|&i| &children[i]).collect();
+    let has_folder = selection.iter().any(|f| f.is_folder());
+
+    let mut actions: Vec<&str> = vec!["Move to…", "Trash"];
+    if !has_folder {
+        actions.insert(0, "Download");
+        actions.insert(2, "Share");
+    }
+    actions.push("Cancel");
+    let Some(action) = dialoguer::Select::new()
+        .with_prompt(format!("{} item(s) selected — action", selection.len()))
+        .items(&actions)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+
+    match actions[action] {
+        "Download" => {
+            let dir: String = dialoguer::Input::new()
+                .with_prompt("Download into")
+                .default(".".to_string())
+                .interact_text()?;
+            let out_dir = Path::new(&dir);
+            std::fs::create_dir_all(out_dir)?;
+            for f in &selection {
+                save_file(drive, f, out_dir)?;
+            }
+        }
+        "Share" => {
+            let email: String = dialoguer::Input::new()
+                .with_prompt("Share with (email)")
+                .interact_text()?;
+            let roles = ["viewer", "commenter", "editor"];
+            let role = dialoguer::Select::new()
+                .with_prompt("Role")
+                .items(roles)
+                .default(0)
+                .interact()?;
+            let api_role = ["reader", "commenter", "writer"][role];
+            for f in &selection {
+                drive.share(&f.id, &email, api_role, false)?;
+                println!("{} shared {} with {}", "✓".green().bold(), f.name.bold(), email);
+            }
+        }
+        "Move to…" => {
+            if let Some((target_id, target_path)) = pick_folder(drive)? {
+                for f in &selection {
+                    let from = f.parents.as_ref().and_then(|p| p.first().cloned());
+                    drive.move_file(&f.id, Some(&target_id), from.as_deref(), None)?;
+                    println!("{} moved {} → {}", "✓".green().bold(), f.name.bold(), target_path.bold());
+                }
+            }
+        }
+        "Trash" => {
+            let names: Vec<&str> = selection.iter().map(|f| f.name.as_str()).collect();
+            let sure = dialoguer::Confirm::new()
+                .with_prompt(format!("Move to Trash: {}?", names.join(", ")))
+                .default(false)
+                .interact()?;
+            if sure {
+                for f in &selection {
+                    drive.trash(&f.id)?;
+                    println!("{} trashed {} (recoverable ~30 days)", "✓".green().bold(), f.name.bold());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Navigate to a destination folder; returns (id, breadcrumb) or None.
+fn pick_folder(drive: &Drive) -> Result<Option<(String, String)>> {
+    let root = drive.get_file("root")?;
+    let mut stack: Vec<(String, String)> = vec![(root.id, "My Drive".into())];
+    loop {
+        let (current_id, _) = stack.last().cloned().unwrap();
+        let folders: Vec<DriveFile> = drive
+            .list_children(&current_id)?
+            .into_iter()
+            .filter(|f| f.is_folder())
+            .collect();
+
+        let mut labels: Vec<String> = vec!["✔ move here".into()];
+        if stack.len() > 1 {
+            labels.push("⬑ ..".into());
+        }
+        labels.extend(folders.iter().map(|f| format!("📁 {}", f.name)));
+
+        let breadcrumb: Vec<&str> = stack.iter().map(|(_, n)| n.as_str()).collect();
+        let Some(picked) = dialoguer::FuzzySelect::new()
+            .with_prompt(format!("Destination: {}", breadcrumb.join(" / ").bold()))
+            .items(&labels)
+            .max_length(20)
+            .default(0)
+            .interact_opt()?
+        else {
+            return Ok(None);
+        };
+
+        let has_up = stack.len() > 1;
+        if picked == 0 {
+            let path: Vec<&str> = stack.iter().map(|(_, n)| n.as_str()).collect();
+            return Ok(Some((stack.last().unwrap().0.clone(), path.join("/"))));
+        }
+        if has_up && picked == 1 {
+            stack.pop();
+            continue;
+        }
+        let folder = &folders[picked - 1 - usize::from(has_up)];
+        stack.push((folder.id.clone(), folder.name.clone()));
     }
 }
 
@@ -554,38 +710,45 @@ pub fn download(account: Option<&str>, paths: &[String], out: Option<&Path>) -> 
         if file.is_folder() {
             bail!("'{path}' is a folder — download individual files (recursive download is planned)");
         }
-        let (mut resp, export_ext) = drive.download(&file)?;
-
-        let mut file_name = file.name.clone();
-        if let Some(ext) = export_ext {
-            if !file_name.to_lowercase().ends_with(&format!(".{ext}")) {
-                file_name = format!("{file_name}.{ext}");
-            }
-        }
-        let dest = out_dir.join(&file_name);
-
-        let len = resp.content_length().or(file.size_bytes()).unwrap_or(0);
-        let bar = ui::transfer_bar(len, &file_name);
-        let mut writer = std::fs::File::create(&dest)
-            .with_context(|| format!("creating {}", dest.display()))?;
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = resp.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            std::io::Write::write_all(&mut writer, &buf[..n])?;
-            bar.inc(n as u64);
-        }
-        bar.finish_and_clear();
-        let exported = export_ext.map(|e| format!(" (exported as .{e})")).unwrap_or_default();
-        println!(
-            "{} downloaded {}{}",
-            "✓".green().bold(),
-            dest.display().to_string().bold(),
-            exported
-        );
+        save_file(&drive, &file, out_dir)?;
     }
+    Ok(())
+}
+
+/// Stream one Drive file to disk (exporting Google-native formats),
+/// printing a progress bar and a confirmation line.
+fn save_file(drive: &Drive, file: &DriveFile, out_dir: &Path) -> Result<()> {
+    let (mut resp, export_ext) = drive.download(file)?;
+
+    let mut file_name = file.name.clone();
+    if let Some(ext) = export_ext {
+        if !file_name.to_lowercase().ends_with(&format!(".{ext}")) {
+            file_name = format!("{file_name}.{ext}");
+        }
+    }
+    let dest = out_dir.join(&file_name);
+
+    let len = resp.content_length().or(file.size_bytes()).unwrap_or(0);
+    let bar = ui::transfer_bar(len, &file_name);
+    let mut writer = std::fs::File::create(&dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut writer, &buf[..n])?;
+        bar.inc(n as u64);
+    }
+    bar.finish_and_clear();
+    let exported = export_ext.map(|e| format!(" (exported as .{e})")).unwrap_or_default();
+    println!(
+        "{} downloaded {}{}",
+        "✓".green().bold(),
+        dest.display().to_string().bold(),
+        exported
+    );
     Ok(())
 }
 

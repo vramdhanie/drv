@@ -102,11 +102,19 @@ enum Command {
     },
     /// Build or refresh the local semantic index of your Drive's contents
     ///
-    /// First run crawls your Drive's metadata and embeds the text of docs,
-    /// sheets, slides, PDFs, and text files with a local model (downloaded
-    /// once, runs entirely on-device). Later runs are incremental via the
-    /// Drive changes feed.
-    Index,
+    /// First run crawls your Drive's metadata and embeds file text with a
+    /// local model (downloaded once, runs entirely on-device); later runs
+    /// are incremental via the Drive changes feed. Name folders with --in
+    /// to limit content indexing to them (the choice persists); without
+    /// roots, only Google-native docs and PDFs drive-wide are indexed.
+    Index {
+        /// Index content only under these folders (repeatable; persisted)
+        #[arg(long = "in")]
+        folders: Vec<String>,
+        /// Clear stored folder roots and index the whole Drive again
+        #[arg(long)]
+        all: bool,
+    },
     /// Semantic search across your indexed Drive
     Search {
         /// What to look for (natural language)
@@ -198,7 +206,7 @@ fn main() {
         }
         Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),
         Command::Download { paths, out } => commands::download(account, &paths, out.as_deref()),
-        Command::Index => commands::index(account),
+        Command::Index { folders, all } => commands::index(account, &folders, all),
         Command::Search { query, folder, limit } => {
             commands::search(account, &query.join(" "), folder.as_deref(), limit)
         }

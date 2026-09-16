@@ -415,9 +415,28 @@ pub fn download(account: Option<&str>, paths: &[String], out: Option<&Path>) -> 
 
 // ---------- index ----------
 
-pub fn index(account: Option<&str>) -> Result<()> {
+pub fn index(account: Option<&str>, in_folders: &[String], all: bool) -> Result<()> {
     let (account, drive) = connect(account)?;
     let mut store = Store::open(&account)?;
+
+    // Scope handling: --in folders persist; --all clears them.
+    if all && !in_folders.is_empty() {
+        bail!("--all and --in are mutually exclusive");
+    }
+    if all {
+        store.set_roots(&[])?;
+    }
+    if !in_folders.is_empty() {
+        let mut roots = Vec::new();
+        for path in in_folders {
+            let folder = drive.resolve(path)?;
+            if !folder.is_folder() {
+                bail!("--in target '{path}' is not a folder");
+            }
+            roots.push((folder.id, path.clone()));
+        }
+        store.set_roots(&roots)?;
+    }
 
     // Sync metadata: incremental via the changes feed when we have a cursor,
     // full crawl otherwise. Grab the next cursor BEFORE crawling so changes
@@ -450,9 +469,25 @@ pub fn index(account: Option<&str>) -> Result<()> {
         }
     }
 
-    // Extract + embed whatever is stale.
-    let stale = store.stale_files(extract::indexable)?;
-    if stale.is_empty() {
+    // Establish the content scope for this run.
+    let roots = store.get_roots()?;
+    let scoped = !roots.is_empty();
+    if scoped {
+        let ids: Vec<String> = roots.iter().map(|(id, _)| id.clone()).collect();
+        let size = store.build_scope(&ids)?;
+        let names: Vec<&str> = roots.iter().map(|(_, p)| p.as_str()).collect();
+        println!("scope: {} ({size} files)", names.join(", ").bold());
+    } else {
+        println!(
+            "scope: whole Drive, Google docs + PDFs only — name folders with {} for deeper indexing",
+            "drv index --in <folder>".green()
+        );
+    }
+
+    // Extract + embed whatever is stale, in batches so a multi-million-file
+    // catalogue never has to sit in memory.
+    let total = store.stale_count(scoped)?;
+    if total == 0 {
         let (files, chunks) = store.stats()?;
         println!(
             "{} index up to date ({files} files catalogued, {chunks} chunks embedded)",
@@ -461,9 +496,9 @@ pub fn index(account: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    println!("indexing content of {} file(s)…", stale.len());
+    println!("indexing content of {total} file(s)…");
     let mut embedder = Embedder::load()?;
-    let bar = indicatif::ProgressBar::new(stale.len() as u64);
+    let bar = indicatif::ProgressBar::new(total as u64);
     bar.set_style(
         indicatif::ProgressStyle::with_template("{msg:30!} [{bar:30.green}] {pos}/{len}")
             .unwrap()
@@ -471,31 +506,36 @@ pub fn index(account: Option<&str>) -> Result<()> {
     );
     let mut embedded = 0usize;
     let mut skipped = 0usize;
-    for (id, name, mime) in &stale {
-        bar.set_message(name.clone());
-        let size = store.file_meta(id)?.and_then(|(_, s)| s);
-        match extract::text_of(&drive, id, mime, size) {
-            Ok(Some(text)) => {
-                let chunks = extract::chunk(&text);
-                let embeddings = embedder.embed_documents(&chunks)?;
-                let rows: Vec<(String, Vec<u8>)> = chunks
-                    .into_iter()
-                    .zip(embeddings.iter().map(|e| crate::embed::to_blob(e)))
-                    .collect();
-                store.set_chunks(id, &rows)?;
-                embedded += 1;
-            }
-            Ok(None) => {
-                store.mark_extracted(id)?;
-                skipped += 1;
-            }
-            Err(e) => {
-                bar.println(format!("{} {name}: {e:#}", "skip".yellow()));
-                store.mark_extracted(id)?;
-                skipped += 1;
-            }
+    loop {
+        let batch = store.stale_batch(scoped, 200)?;
+        if batch.is_empty() {
+            break;
         }
-        bar.inc(1);
+        for (id, name, mime, size) in batch {
+            bar.set_message(name.clone());
+            match extract::text_of(&drive, &id, &mime, size) {
+                Ok(Some(text)) => {
+                    let chunks = extract::chunk(&text);
+                    let embeddings = embedder.embed_documents(&chunks)?;
+                    let rows: Vec<(String, Vec<u8>)> = chunks
+                        .into_iter()
+                        .zip(embeddings.iter().map(|e| crate::embed::to_blob(e)))
+                        .collect();
+                    store.set_chunks(&id, &rows)?;
+                    embedded += 1;
+                }
+                Ok(None) => {
+                    store.mark_extracted(&id)?;
+                    skipped += 1;
+                }
+                Err(e) => {
+                    bar.println(format!("{} {name}: {e:#}", "skip".yellow()));
+                    store.mark_extracted(&id)?;
+                    skipped += 1;
+                }
+            }
+            bar.inc(1);
+        }
     }
     bar.finish_and_clear();
     let (files, chunks) = store.stats()?;

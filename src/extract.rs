@@ -5,17 +5,6 @@ use crate::drive::Drive;
 /// Files larger than this are skipped for content extraction.
 const MAX_EXTRACT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Can we get text out of this mime type at all?
-pub fn indexable(mime: &str) -> bool {
-    matches!(
-        mime,
-        "application/vnd.google-apps.document"
-            | "application/vnd.google-apps.spreadsheet"
-            | "application/vnd.google-apps.presentation"
-            | "application/pdf"
-    ) || mime.starts_with("text/")
-        || matches!(mime, "application/json" | "application/xml" | "application/rtf")
-}
 
 /// Pull the plain text of a file, best effort. `Ok(None)` means "skipped".
 pub fn text_of(drive: &Drive, id: &str, mime: &str, size: Option<i64>) -> Result<Option<String>> {

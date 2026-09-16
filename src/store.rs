@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 
 use crate::config;
 use crate::drive::DriveFile;
@@ -10,6 +10,9 @@ use crate::drive::DriveFile;
 pub struct Store {
     pub db: Connection,
 }
+
+/// (id, name, mime, size) of a file awaiting content extraction.
+pub type StaleFile = (String, String, String, Option<i64>);
 
 pub struct SearchHit {
     pub file_id: String,
@@ -89,35 +92,100 @@ impl Store {
         Ok(())
     }
 
-    /// Files whose content has changed since we last extracted it (or was
-    /// never extracted) — restricted to the given indexable mime check.
-    pub fn stale_files(&self, indexable: impl Fn(&str) -> bool) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, name, mime FROM files
-             WHERE extracted_modified IS NULL OR extracted_modified != COALESCE(modified, '')",
+    // ----- index scope (folder roots) -----
+
+    /// The persisted folder roots this account's content index is limited
+    /// to, as (folderId, displayPath). Empty = whole Drive.
+    pub fn get_roots(&self) -> Result<Vec<(String, String)>> {
+        match self.meta_get("index_roots")? {
+            Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn set_roots(&self, roots: &[(String, String)]) -> Result<()> {
+        self.meta_set("index_roots", &serde_json::to_string(roots)?)
+    }
+
+    /// Materialize the set of file IDs under the given roots into a temp
+    /// table (recursive walk done inside SQLite). Returns the scope size.
+    pub fn build_scope(&self, root_ids: &[String]) -> Result<i64> {
+        self.db.execute_batch(
+            "DROP TABLE IF EXISTS temp.scope_roots;
+             DROP TABLE IF EXISTS temp.scope;
+             CREATE TEMP TABLE scope_roots(id TEXT PRIMARY KEY);
+             CREATE TEMP TABLE scope(id TEXT PRIMARY KEY);",
         )?;
+        for id in root_ids {
+            self.db
+                .execute("INSERT OR IGNORE INTO temp.scope_roots VALUES(?1)", [id])?;
+        }
+        self.db.execute(
+            "INSERT OR IGNORE INTO temp.scope
+             WITH RECURSIVE d(id) AS (
+               SELECT id FROM temp.scope_roots
+               UNION
+               SELECT f.id FROM files f JOIN d ON f.parent = d.id
+             )
+             SELECT id FROM d",
+            [],
+        )?;
+        Ok(self
+            .db
+            .query_row("SELECT COUNT(*) FROM temp.scope", [], |r| r.get(0))?)
+    }
+
+    // ----- stale-content queries -----
+
+    /// Google-native documents plus PDFs: the whole-drive default.
+    const MIME_STRICT: &'static str = "mime IN (
+        'application/vnd.google-apps.document',
+        'application/vnd.google-apps.spreadsheet',
+        'application/vnd.google-apps.presentation',
+        'application/pdf')";
+    /// Within named roots we also take text-like files.
+    const MIME_BROAD: &'static str = "(mime IN (
+        'application/vnd.google-apps.document',
+        'application/vnd.google-apps.spreadsheet',
+        'application/vnd.google-apps.presentation',
+        'application/pdf', 'application/json', 'application/xml',
+        'application/rtf')
+        OR mime LIKE 'text/%')";
+
+    fn stale_where(scoped: bool) -> String {
+        format!(
+            "(extracted_modified IS NULL OR extracted_modified != COALESCE(modified, ''))
+             AND {} {}",
+            if scoped { Self::MIME_BROAD } else { Self::MIME_STRICT },
+            if scoped { "AND id IN (SELECT id FROM temp.scope)" } else { "" },
+        )
+    }
+
+    pub fn stale_count(&self, scoped: bool) -> Result<i64> {
+        Ok(self.db.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE {}", Self::stale_where(scoped)),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Next batch of files needing content extraction: (id, name, mime, size).
+    /// Processing a file updates extracted_modified, so repeated calls
+    /// naturally advance through the queue without an offset.
+    pub fn stale_batch(&self, scoped: bool, limit: usize) -> Result<Vec<StaleFile>> {
+        let sql = format!(
+            "SELECT id, name, mime, size FROM files WHERE {} LIMIT {limit}",
+            Self::stale_where(scoped)
+        );
+        let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, mime) = row?;
-            if indexable(&mime) {
-                out.push((id, name, mime));
-            }
+            out.push(row?);
         }
         Ok(out)
-    }
-
-    pub fn file_meta(&self, id: &str) -> Result<Option<(Option<String>, Option<i64>)>> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT modified, size FROM files WHERE id = ?1")?;
-        let mut rows = stmt.query([id])?;
-        Ok(rows
-            .next()?
-            .map(|r| Ok::<_, rusqlite::Error>((r.get(0)?, r.get(1)?)))
-            .transpose()?)
     }
 
     /// Replace a file's chunks and mark its content as extracted.
@@ -150,26 +218,21 @@ impl Store {
         Ok(())
     }
 
-    /// The set of file IDs under a folder (inclusive), using stored parents.
+    /// The set of file IDs under a folder (inclusive), walked inside SQLite
+    /// so the whole file tree never has to be loaded into memory.
     pub fn descendants(&self, folder_id: &str) -> Result<HashSet<String>> {
-        let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut stmt = self.db.prepare("SELECT id, parent FROM files WHERE parent IS NOT NULL")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = self.db.prepare(
+            "WITH RECURSIVE d(id) AS (
+               VALUES(?1)
+               UNION
+               SELECT f.id FROM files f JOIN d ON f.parent = d.id
+             )
+             SELECT id FROM d",
+        )?;
+        let rows = stmt.query_map([folder_id], |r| r.get::<_, String>(0))?;
+        let mut seen = HashSet::new();
         for row in rows {
-            let (id, parent) = row?;
-            children.entry(parent).or_default().push(id);
-        }
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<String> = VecDeque::from([folder_id.to_string()]);
-        while let Some(id) = queue.pop_front() {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            if let Some(kids) = children.get(&id) {
-                queue.extend(kids.iter().cloned());
-            }
+            seen.insert(row?);
         }
         Ok(seen)
     }

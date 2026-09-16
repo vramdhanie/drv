@@ -28,7 +28,7 @@ fn entry(name: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| anyhow!("keychain: {e}"))
 }
 
-pub fn keychain_get(name: &str) -> Result<Option<String>> {
+fn keychain_get(name: &str) -> Result<Option<String>> {
     match entry(name)?.get_password() {
         Ok(v) => Ok(Some(v)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -36,13 +36,13 @@ pub fn keychain_get(name: &str) -> Result<Option<String>> {
     }
 }
 
-pub fn keychain_set(name: &str, value: &str) -> Result<()> {
+fn keychain_set(name: &str, value: &str) -> Result<()> {
     entry(name)?
         .set_password(value)
         .map_err(|e| anyhow!("keychain write ({name}): {e}"))
 }
 
-pub fn keychain_delete(name: &str) -> Result<()> {
+fn keychain_delete(name: &str) -> Result<()> {
     match entry(name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow!("keychain delete ({name}): {e}")),
@@ -56,9 +56,15 @@ pub struct ClientCreds {
 
 /// Resolve the OAuth client: user-configured (BYO) first, then embedded.
 pub fn resolve_client() -> Result<ClientCreds> {
+    resolve_client_from(&load_secrets()?)
+}
+
+fn resolve_client_from(secrets: &Secrets) -> Result<ClientCreds> {
     let cfg = config::load()?;
     if let Some(id) = cfg.client_id {
-        let secret = keychain_get("google-client-secret")?
+        let secret = secrets
+            .google_client_secret
+            .clone()
             .context("client ID configured but its secret is missing — run `drv auth login --client-id ... --client-secret ...` again")?;
         return Ok(ClientCreds { id, secret });
     }
@@ -80,30 +86,72 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
-fn token_entry(account: &str) -> String {
-    format!("google-refresh-token:{account}")
+/// All of drv's secrets live in ONE Keychain item, so macOS asks for
+/// permission once per (re)built binary instead of once per secret.
+#[derive(Default, serde::Serialize, Deserialize)]
+pub struct Secrets {
+    pub google_client_secret: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    #[serde(default)]
+    pub refresh_tokens: std::collections::HashMap<String, String>,
 }
 
-/// v0.1 stored a single token under "google-refresh-token"; adopt it as the
-/// account alias "default" so upgrades keep working. Returns the alias if a
-/// migration happened.
-pub fn migrate_legacy() -> Result<Option<String>> {
-    if let Some(token) = keychain_get("google-refresh-token")? {
-        keychain_set(&token_entry("default"), &token)?;
-        keychain_delete("google-refresh-token")?;
-        crate::config::register_account("default")?;
-        return Ok(Some("default".into()));
+const SECRETS_ENTRY: &str = "secrets";
+
+pub fn load_secrets() -> Result<Secrets> {
+    if let Some(json) = keychain_get(SECRETS_ENTRY)? {
+        return Ok(serde_json::from_str(&json).unwrap_or_default());
     }
-    Ok(None)
+    // Migrate the per-secret entries earlier versions created.
+    let mut secrets = Secrets::default();
+    let mut migrated = false;
+    if let Some(v) = keychain_get("google-client-secret")? {
+        secrets.google_client_secret = Some(v);
+        migrated = true;
+    }
+    if let Some(v) = keychain_get("anthropic-api-key")? {
+        secrets.anthropic_api_key = Some(v);
+        migrated = true;
+    }
+    // v0.1 single-account entry becomes the "default" alias…
+    if let Some(v) = keychain_get("google-refresh-token")? {
+        secrets.refresh_tokens.insert("default".into(), v);
+        crate::config::register_account("default")?;
+        migrated = true;
+    }
+    // …and v0.2 per-alias entries carry their alias over.
+    for alias in crate::config::load()?.accounts {
+        if let Some(v) = keychain_get(&format!("google-refresh-token:{alias}"))? {
+            secrets.refresh_tokens.insert(alias, v);
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_secrets(&secrets)?;
+        for name in ["google-client-secret", "anthropic-api-key", "google-refresh-token"] {
+            keychain_delete(name)?;
+        }
+        for alias in secrets.refresh_tokens.keys() {
+            keychain_delete(&format!("google-refresh-token:{alias}"))?;
+        }
+    }
+    Ok(secrets)
+}
+
+pub fn save_secrets(secrets: &Secrets) -> Result<()> {
+    keychain_set(SECRETS_ENTRY, &serde_json::to_string(secrets)?)
 }
 
 pub fn store_refresh(account: &str, refresh: &str) -> Result<()> {
-    keychain_set(&token_entry(account), refresh)
+    let mut secrets = load_secrets()?;
+    secrets.refresh_tokens.insert(account.into(), refresh.into());
+    save_secrets(&secrets)
 }
 
-
 pub fn forget_account(account: &str) -> Result<()> {
-    keychain_delete(&token_entry(account))
+    let mut secrets = load_secrets()?;
+    secrets.refresh_tokens.remove(account);
+    save_secrets(&secrets)
 }
 
 /// Run the browser PKCE flow. Returns (refresh_token, access_token) so the
@@ -201,12 +249,14 @@ fn wait_for_code(listener: &TcpListener) -> Result<String> {
 }
 
 /// Exchange the stored refresh token of an account for a fresh access token.
+/// One Keychain read covers both the token and the client secret.
 pub fn access_token(account: &str) -> Result<String> {
-    let refresh = keychain_get(&token_entry(account))?.context(format!(
+    let secrets = load_secrets()?;
+    let refresh = secrets.refresh_tokens.get(account).cloned().context(format!(
         "account '{account}' has no stored credentials — run {}",
         "drv auth login".green()
     ))?;
-    let client = resolve_client()?;
+    let client = resolve_client_from(&secrets)?;
     let resp = reqwest::blocking::Client::new()
         .post(TOKEN_URL)
         .form(&[

@@ -12,11 +12,10 @@ use crate::extract;
 use crate::store::Store;
 use crate::ui;
 
-/// Resolve which account this invocation acts on (after any v0.1 migration).
+/// Resolve which account this invocation acts on. Loading secrets first
+/// runs any migration of older per-secret Keychain entries.
 fn account_for(flag: Option<&str>) -> Result<String> {
-    if let Some(alias) = auth::migrate_legacy()? {
-        eprintln!("{} adopted v0.1 credentials as account '{alias}'", "note:".yellow());
-    }
+    let _ = auth::load_secrets()?;
     config::resolve_account(flag)
 }
 
@@ -38,7 +37,9 @@ pub fn auth_login(
         let mut cfg = config::load()?;
         cfg.client_id = Some(id.clone());
         config::save(&cfg)?;
-        auth::keychain_set("google-client-secret", &secret)?;
+        let mut secrets = auth::load_secrets()?;
+        secrets.google_client_secret = Some(secret.clone());
+        auth::save_secrets(&secrets)?;
         println!("Using your own OAuth client ({}).", "saved for future runs".dimmed());
         ClientCreds { id, secret }
     } else {
@@ -68,7 +69,7 @@ pub fn auth_login(
 }
 
 pub fn auth_status(flag: Option<&str>) -> Result<()> {
-    let _ = auth::migrate_legacy()?;
+    let secrets = auth::load_secrets()?;
     let cfg = config::load()?;
     if cfg.accounts.is_empty() {
         println!("{} not signed in — run {}.", "✗".red(), "drv auth login".green());
@@ -106,7 +107,7 @@ pub fn auth_status(flag: Option<&str>) -> Result<()> {
             }
         }
     }
-    let claude_key = auth::keychain_get("anthropic-api-key")?.is_some();
+    let claude_key = secrets.anthropic_api_key.is_some();
     println!(
         "{} Claude API key {}",
         if claude_key { "✓".green().bold() } else { "○".dimmed() },
@@ -144,7 +145,9 @@ pub fn auth_claude() -> Result<()> {
     if !key.starts_with("sk-ant-") {
         println!("{} key doesn't look like an Anthropic key (sk-ant-…) — storing anyway.", "note:".yellow());
     }
-    auth::keychain_set("anthropic-api-key", key)?;
+    let mut secrets = auth::load_secrets()?;
+    secrets.anthropic_api_key = Some(key.to_string());
+    auth::save_secrets(&secrets)?;
     println!("{} Claude API key stored in the Keychain.", "✓".green().bold());
     Ok(())
 }
@@ -152,7 +155,7 @@ pub fn auth_claude() -> Result<()> {
 // ---------- account ----------
 
 pub fn account_list() -> Result<()> {
-    let _ = auth::migrate_legacy()?;
+    let _ = auth::load_secrets()?;
     let cfg = config::load()?;
     if cfg.accounts.is_empty() {
         println!("No accounts — run {}.", "drv auth login".green());

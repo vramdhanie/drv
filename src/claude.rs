@@ -11,7 +11,7 @@ const MODEL: &str = "claude-opus-5";
 /// Server-side refusal fallbacks are enabled so a declined request degrades
 /// to another model instead of failing outright.
 pub fn ask(system: &str, user: &str, model: Option<&str>) -> Result<String> {
-    let key = auth::keychain_get("anthropic-api-key")?.context(format!(
+    let key = auth::load_secrets()?.anthropic_api_key.context(format!(
         "no Anthropic API key stored — add one with {}",
         "drv auth claude".green()
     ))?;

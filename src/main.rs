@@ -89,6 +89,25 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Print a file's contents
+    ///
+    /// Google Docs/Sheets/Slides print their text/CSV export; text files
+    /// print as-is; binary files stream only when redirected (real cat
+    /// semantics, so `drv cat photo.jpg > p.jpg` copies the file).
+    Cat {
+        /// File path, or "id:<fileId>"
+        path: String,
+    },
+    /// Edit a file in your editor and save it back to Drive
+    ///
+    /// Downloads to a temp file, opens $EDITOR (default: vim), and — only
+    /// if the content changed — uploads it back in place. Google-native
+    /// documents are export-only and can't be edited this way.
+    #[command(visible_alias = "vim")]
+    Edit {
+        /// File path, or "id:<fileId>"
+        path: String,
+    },
     /// Move or rename a file or folder
     ///
     /// If DEST is an existing folder, SOURCE moves into it keeping its
@@ -253,6 +272,8 @@ fn main() {
         Command::Cp { path, new_name, to } => {
             commands::cp(account, &path, new_name.as_deref(), to.as_deref())
         }
+        Command::Cat { path } => commands::cat(account, &path),
+        Command::Edit { path } => commands::edit(account, &path),
         Command::Mv { source, dest } => commands::mv(account, &source, &dest),
         Command::Rm { paths } => commands::rm(account, &paths),
         Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),

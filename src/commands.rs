@@ -557,6 +557,119 @@ pub fn cp(account: Option<&str>, path: &str, new_name: Option<&str>, to: Option<
     Ok(())
 }
 
+// ---------- cat ----------
+
+/// Follow a shortcut to its target; other files pass through.
+fn deref_shortcut(drive: &Drive, file: DriveFile) -> Result<DriveFile> {
+    if file.is_shortcut() {
+        if let Some(target) = file.shortcut_details.as_ref().and_then(|d| d.target_id.as_deref()) {
+            return drive.get_file(target);
+        }
+    }
+    Ok(file)
+}
+
+pub fn cat(account: Option<&str>, path: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let (_, drive) = connect(account)?;
+    let file = deref_shortcut(&drive, drive.resolve(path)?)?;
+    if file.is_folder() {
+        bail!("'{path}' is a folder — use drv ls");
+    }
+
+    // Google-native formats have no raw bytes; print their text export.
+    let export = match file.mime_type.as_str() {
+        "application/vnd.google-apps.document" | "application/vnd.google-apps.presentation" => {
+            Some("text/plain")
+        }
+        "application/vnd.google-apps.spreadsheet" => Some("text/csv"),
+        _ => None,
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Some(mime) = export {
+        let text = drive.export_text(&file.id, mime)?;
+        stdout.write_all(text.as_bytes())?;
+        if !text.ends_with('\n') {
+            let _ = writeln!(stdout);
+        }
+        return Ok(());
+    }
+
+    let texty = file.mime_type.starts_with("text/")
+        || matches!(
+            file.mime_type.as_str(),
+            "application/json" | "application/xml" | "application/rtf" | "application/x-sh"
+        );
+    if !texty && std::io::stdout().is_terminal() {
+        bail!(
+            "'{}' is {} — refusing to write binary to your terminal.\nRedirect it (drv cat … > file) or use drv download",
+            file.name,
+            file.mime_type
+        );
+    }
+    // Stream raw bytes: real `cat` semantics, so redirection copies the file.
+    let (mut resp, _) = drive.download(&file)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        stdout.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+// ---------- edit / vim ----------
+
+pub fn edit(account: Option<&str>, path: &str) -> Result<()> {
+    use sha2::Digest;
+    let (_, drive) = connect(account)?;
+    let file = deref_shortcut(&drive, drive.resolve(path)?)?;
+    if file.is_folder() {
+        bail!("'{path}' is a folder");
+    }
+    if file.mime_type.starts_with("application/vnd.google-apps.") {
+        bail!(
+            "'{}' is a Google-native document — it has no editable raw content (export-only).\nEdit it at its Drive link, or use drv cat to read its text",
+            file.name
+        );
+    }
+
+    let original = drive.download_bytes(&file.id, 32 * 1024 * 1024)?;
+    let before = sha2::Sha256::digest(&original);
+
+    // Keep the original extension so the editor picks the right filetype.
+    let tmp = std::env::temp_dir().join(format!("drv-edit-{}-{}", &file.id[..8.min(file.id.len())], file.name));
+    std::fs::write(&tmp, &original).with_context(|| format!("writing {}", tmp.display()))?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("launching {editor}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("{editor} exited with {status} — nothing uploaded");
+    }
+
+    let edited = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    if sha2::Sha256::digest(&edited) == before {
+        println!("{}", "no changes — nothing uploaded".dimmed());
+        return Ok(());
+    }
+    let len = edited.len() as u64;
+    drive.update_content(&file.id, &file.mime_type, edited)?;
+    println!(
+        "{} saved {} back to Drive ({})",
+        "✓".green().bold(),
+        file.name.bold(),
+        ui::human_size(len)
+    );
+    Ok(())
+}
+
 // ---------- mv ----------
 
 pub fn mv(account: Option<&str>, source: &str, dest: &str) -> Result<()> {

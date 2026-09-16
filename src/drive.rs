@@ -261,6 +261,20 @@ impl Drive {
         Ok(check(resp)?.json()?)
     }
 
+    /// Replace a file's content in place (metadata untouched).
+    pub fn update_content(&self, file_id: &str, content_type: &str, bytes: Vec<u8>) -> Result<DriveFile> {
+        let resp = self
+            .http
+            .patch(format!("{UPLOAD_API}/files/{file_id}"))
+            .bearer_auth(self.bearer())
+            .query(&[("uploadType", "media"), ("fields", FILE_FIELDS)])
+            .header("Content-Type", content_type)
+            .body(bytes)
+            .send()
+            .context("updating file content")?;
+        Ok(check(resp)?.json()?)
+    }
+
     /// Create a folder inside a parent folder.
     pub fn create_folder(&self, name: &str, parent_id: &str) -> Result<DriveFile> {
         let resp = self

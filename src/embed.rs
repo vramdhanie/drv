@@ -12,7 +12,8 @@ pub struct Embedder {
 impl Embedder {
     /// Loads (downloading on first use, ~130 MB) the local embedding model.
     /// Everything runs on-device; nothing is sent to any service.
-    pub fn load() -> Result<Self> {
+    /// `threads` caps ONNX's CPU use — the default would take every core.
+    pub fn load(threads: usize) -> Result<Self> {
         let cache = dirs::cache_dir()
             .context("no cache directory")?
             .join("drv")
@@ -21,7 +22,8 @@ impl Embedder {
         let model = TextEmbedding::try_new(
             TextInitOptions::new(EmbeddingModel::BGESmallENV15)
                 .with_cache_dir(cache)
-                .with_show_download_progress(true),
+                .with_show_download_progress(true)
+                .with_intra_threads(threads.max(1)),
         )
         .context("loading embedding model")?;
         Ok(Self { model })

@@ -486,7 +486,39 @@ pub fn download(account: Option<&str>, paths: &[String], out: Option<&Path>) -> 
 
 // ---------- index ----------
 
-pub fn index(account: Option<&str>, in_folders: &[String], all: bool) -> Result<()> {
+/// Peak resident memory in bytes (ru_maxrss is bytes on macOS, KB on Linux).
+fn peak_rss() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let raw = usage.ru_maxrss as u64;
+    if cfg!(target_os = "macos") { raw } else { raw * 1024 }
+}
+
+/// Demote this process so indexing never competes with the user's apps:
+/// lowest CPU priority, and (on macOS) throttled disk I/O.
+fn go_background() {
+    // Not in the libc crate: constants from <sys/resource.h>.
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;
+    }
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        #[cfg(target_os = "macos")]
+        setiopolicy_np(0 /* IOPOL_TYPE_DISK */, 0 /* IOPOL_SCOPE_PROCESS */, 3 /* IOPOL_THROTTLE */);
+    }
+}
+
+pub fn index(
+    account: Option<&str>,
+    in_folders: &[String],
+    all: bool,
+    threads: usize,
+    max_mem_gb: u64,
+) -> Result<()> {
+    go_background();
     let (account, drive) = connect(account)?;
     let mut store = Store::open(&account)?;
 
@@ -567,8 +599,9 @@ pub fn index(account: Option<&str>, in_folders: &[String], all: bool) -> Result<
         return Ok(());
     }
 
-    println!("indexing content of {total} file(s)…");
-    let mut embedder = Embedder::load()?;
+    println!("indexing content of {total} file(s)… ({threads} embedding thread(s), background priority)");
+    let mut embedder = Embedder::load(threads)?;
+    let mem_ceiling = max_mem_gb * 1024 * 1024 * 1024;
     let bar = indicatif::ProgressBar::new(total as u64);
     bar.set_style(
         indicatif::ProgressStyle::with_template("{msg:30!} [{bar:30.green}] {pos}/{len}")
@@ -578,6 +611,20 @@ pub fn index(account: Option<&str>, in_folders: &[String], all: bool) -> Result<
     let mut embedded = 0usize;
     let mut skipped = 0usize;
     loop {
+        // Extraction leaks a little on malformed files and ONNX arenas only
+        // grow, so a long run's memory ratchets upward. Past the ceiling,
+        // stop cleanly — everything done so far is saved, and the next
+        // `drv index` (a fresh process) continues from where this left off.
+        if peak_rss() > mem_ceiling {
+            bar.finish_and_clear();
+            println!(
+                "{} memory ceiling ({max_mem_gb} GB) reached after {embedded} file(s) — progress saved.\n  Run {} again to continue (or loop it: {})",
+                "⏸".yellow().bold(),
+                "drv index".green(),
+                "while drv index; [ $? -eq 75 ]; do :; done".dimmed()
+            );
+            std::process::exit(75); // EX_TEMPFAIL: try again
+        }
         let batch = store.stale_batch(scoped, 200)?;
         if batch.is_empty() {
             break;
@@ -632,7 +679,7 @@ pub fn search(account: Option<&str>, query: &str, folder: Option<&str>, limit: u
         None => None,
     };
 
-    let mut embedder = Embedder::load()?;
+    let mut embedder = Embedder::load(2)?;
     let query_emb = embedder.embed_query(query)?;
     let hits = store.search(&query_emb, scope.as_ref(), limit * 3)?;
 
@@ -686,7 +733,7 @@ pub fn prompt(
         None => None,
     };
 
-    let mut embedder = Embedder::load()?;
+    let mut embedder = Embedder::load(2)?;
     let query_emb = embedder.embed_query(question)?;
     let hits = store.search(&query_emb, scope.as_ref(), 12)?;
     if hits.is_empty() {

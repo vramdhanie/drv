@@ -132,6 +132,12 @@ enum Command {
         /// Clear stored folder roots and index the whole Drive again
         #[arg(long)]
         all: bool,
+        /// CPU threads for the embedding model (more = faster but heavier)
+        #[arg(long, default_value_t = 2)]
+        threads: usize,
+        /// Stop cleanly (exit 75, resumable) past this much memory, in GB
+        #[arg(long, default_value_t = 3)]
+        max_mem: u64,
     },
     /// Semantic search across your indexed Drive
     Search {
@@ -226,7 +232,9 @@ fn main() {
         Command::Rm { paths } => commands::rm(account, &paths),
         Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),
         Command::Download { paths, out } => commands::download(account, &paths, out.as_deref()),
-        Command::Index { folders, all } => commands::index(account, &folders, all),
+        Command::Index { folders, all, threads, max_mem } => {
+            commands::index(account, &folders, all, threads, max_mem)
+        }
         Command::Search { query, folder, limit } => {
             commands::search(account, &query.join(" "), folder.as_deref(), limit)
         }

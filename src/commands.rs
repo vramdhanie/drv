@@ -752,6 +752,231 @@ fn save_file(drive: &Drive, file: &DriveFile, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------- do (natural-language tasks) ----------
+
+#[derive(serde::Deserialize)]
+struct TaskPlan {
+    #[serde(default)]
+    steps: Vec<TaskStep>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum TaskStep {
+    Rename { id: String, new_name: String },
+    Move { id: String, dest: String },
+    Copy { id: String, new_name: Option<String>, dest: Option<String> },
+    Trash { id: String },
+    Share { id: String, email: String, role: String },
+    Download { id: String, out: Option<String> },
+    Mkdir { name: String, dest: Option<String> },
+}
+
+const DO_SYSTEM: &str = r#"You plan file operations on the user's Google Drive from a natural-language instruction. You are given the metadata listing of one folder (id, name, mimeType, size in bytes, modifiedTime, createdTime per item) and must respond with ONLY a JSON object — no prose, no markdown fences — of this shape:
+
+{"steps": [ ... ], "notes": "one short sentence for the user, or null"}
+
+Allowed steps (use ONLY ids present in the listing):
+  {"op":"rename","id":"...","new_name":"..."}
+  {"op":"move","id":"...","dest":"<folder path relative to the listed folder>"}
+  {"op":"copy","id":"...","new_name":null,"dest":null}            // file duplicate; folders cannot be copied
+  {"op":"trash","id":"..."}                                       // recoverable; the ONLY form of deletion
+  {"op":"share","id":"...","email":"...","role":"viewer|commenter|editor"}
+  {"op":"download","id":"...","out":null}                         // out: local directory, default "."
+  {"op":"mkdir","name":"...","dest":null}                         // dest: parent path relative to the listed folder, null = the listed folder itself
+
+Rules:
+- Steps run in order; a folder made by mkdir may be used as a later dest.
+- Only operate on items the instruction actually describes. When the instruction is ambiguous or matches nothing, return an empty steps array and explain in notes.
+- Never invent email addresses — share only with addresses given in the instruction.
+- You only have metadata. If the instruction needs file CONTENTS (e.g. a date printed inside a document), say so in notes and plan only what metadata supports.
+- At most 200 steps."#;
+
+pub fn do_task(account: Option<&str>, folder: Option<&str>, instruction: &str, yes: bool) -> Result<()> {
+    let (_, drive) = connect(account)?;
+    let scope = drive.resolve(folder.unwrap_or(""))?;
+    if !scope.is_folder() {
+        bail!("--in target is not a folder");
+    }
+    let children = drive.list_children(&scope.id)?;
+    if children.len() > 1500 {
+        bail!(
+            "folder has {} items — too many for one plan; narrow the scope with --in",
+            children.len()
+        );
+    }
+    let by_id: std::collections::HashMap<&str, &DriveFile> =
+        children.iter().map(|f| (f.id.as_str(), f)).collect();
+
+    let listing = serde_json::to_string(
+        &children
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id,
+                    "name": f.name,
+                    "mimeType": f.mime_type,
+                    "size": f.size_bytes(),
+                    "modifiedTime": f.modified_time,
+                    "createdTime": f.created_time,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    eprintln!("{}", "planning…".dimmed());
+    let raw = claude::ask(
+        DO_SYSTEM,
+        &format!(
+            "Folder: {}\nListing ({} items):\n{}\n\nInstruction: {}",
+            folder.unwrap_or("My Drive root"),
+            children.len(),
+            listing,
+            instruction
+        ),
+        None,
+    )?;
+    // Tolerate a fenced response despite instructions.
+    let raw = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let plan: TaskPlan = serde_json::from_str(raw)
+        .with_context(|| format!("could not parse the plan Claude returned:\n{raw}"))?;
+
+    if let Some(notes) = &plan.notes {
+        println!("{} {notes}", "note:".yellow());
+    }
+    if plan.steps.is_empty() {
+        println!("{}", "nothing to do".dimmed());
+        return Ok(());
+    }
+    if plan.steps.len() > 200 {
+        bail!("plan has {} steps — refusing; narrow the instruction", plan.steps.len());
+    }
+
+    // Validate ids and describe each step before anything happens.
+    let name_of = |id: &str| -> Result<&str> {
+        by_id
+            .get(id)
+            .map(|f| f.name.as_str())
+            .with_context(|| format!("plan references id '{id}' that is not in this folder — refusing"))
+    };
+    println!("\n{}", format!("Plan ({} step(s)):", plan.steps.len()).bold());
+    for (i, step) in plan.steps.iter().enumerate() {
+        let line = match step {
+            TaskStep::Rename { id, new_name } => format!("rename  {} → {}", name_of(id)?, new_name.bold()),
+            TaskStep::Move { id, dest } => format!("move    {} → {}/", name_of(id)?, dest.bold()),
+            TaskStep::Copy { id, new_name, dest } => format!(
+                "copy    {}{}{}",
+                name_of(id)?,
+                new_name.as_deref().map(|n| format!(" as {}", n.bold())).unwrap_or_default(),
+                dest.as_deref().map(|d| format!(" → {d}/")).unwrap_or_default()
+            ),
+            TaskStep::Trash { id } => format!("trash   {} {}", name_of(id)?, "(recoverable)".dimmed()),
+            TaskStep::Share { id, email, role } => {
+                if !["viewer", "commenter", "editor"].contains(&role.as_str()) {
+                    bail!("plan contains invalid share role '{role}' — refusing");
+                }
+                format!("share   {} with {} as {role}", name_of(id)?, email.bold())
+            }
+            TaskStep::Download { id, out } => {
+                format!("download {} → {}/", name_of(id)?, out.as_deref().unwrap_or("."))
+            }
+            TaskStep::Mkdir { name, dest } => format!(
+                "mkdir   {}/ in {}/",
+                name.bold(),
+                dest.as_deref().unwrap_or("(this folder)")
+            ),
+        };
+        println!("  {:>3}. {line}", i + 1);
+    }
+
+    if !yes {
+        let go = dialoguer::Confirm::new()
+            .with_prompt("Execute this plan?")
+            .default(false)
+            .interact()?;
+        if !go {
+            println!("{}", "cancelled — nothing was changed".dimmed());
+            return Ok(());
+        }
+    }
+
+    // Dest paths resolve relative to the scope folder at execution time, so
+    // folders created by earlier mkdir steps are usable as destinations.
+    let resolve_dest = |dest: &str| -> Result<DriveFile> {
+        let folder = drive.resolve_from(scope.clone(), dest)?;
+        if !folder.is_folder() {
+            bail!("'{dest}' is not a folder");
+        }
+        Ok(folder)
+    };
+
+    let (mut done, mut failed) = (0usize, 0usize);
+    for (i, step) in plan.steps.iter().enumerate() {
+        let result: Result<()> = (|| {
+            match step {
+                TaskStep::Rename { id, new_name } => {
+                    drive.move_file(id, None, None, Some(new_name))?;
+                }
+                TaskStep::Move { id, dest } => {
+                    let target = resolve_dest(dest)?;
+                    let from = by_id.get(id.as_str()).and_then(|f| f.parents.as_ref()).and_then(|p| p.first().cloned());
+                    drive.move_file(id, Some(&target.id), from.as_deref(), None)?;
+                }
+                TaskStep::Copy { id, new_name, dest } => {
+                    let parent = dest.as_deref().map(resolve_dest).transpose()?;
+                    drive.copy(id, new_name.as_deref(), parent.as_ref().map(|f| f.id.as_str()))?;
+                }
+                TaskStep::Trash { id } => drive.trash(id)?,
+                TaskStep::Share { id, email, role } => {
+                    let api_role = match role.as_str() {
+                        "viewer" => "reader",
+                        "commenter" => "commenter",
+                        _ => "writer",
+                    };
+                    drive.share(id, email, api_role, false)?;
+                }
+                TaskStep::Download { id, out } => {
+                    let out_dir = PathBuf::from(out.as_deref().unwrap_or("."));
+                    std::fs::create_dir_all(&out_dir)?;
+                    let file = drive.get_file(id)?;
+                    save_file(&drive, &file, &out_dir)?;
+                }
+                TaskStep::Mkdir { name, dest } => {
+                    let parent = match dest.as_deref() {
+                        Some(d) => resolve_dest(d)?,
+                        None => scope.clone(),
+                    };
+                    drive.create_folder(name, &parent.id)?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                done += 1;
+                println!("{} step {}", "✓".green().bold(), i + 1);
+            }
+            Err(e) => {
+                failed += 1;
+                println!("{} step {} failed: {e:#}", "✗".red().bold(), i + 1);
+            }
+        }
+    }
+    println!(
+        "\n{} {done} step(s) done{}",
+        if failed == 0 { "✓".green().bold() } else { "!".yellow().bold() },
+        if failed > 0 { format!(", {failed} failed") } else { String::new() }
+    );
+    Ok(())
+}
+
 // ---------- index ----------
 
 /// Peak resident memory in bytes (ru_maxrss is bytes on macOS, KB on Linux).

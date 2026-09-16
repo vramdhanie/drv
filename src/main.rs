@@ -158,6 +158,23 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 8)]
         limit: usize,
     },
+    /// Describe tasks in natural language; review the plan, then run it
+    ///
+    /// Claude turns your instruction plus the folder's metadata listing
+    /// into a concrete plan (rename / move / copy / share / download /
+    /// trash / new folders). The plan is printed and NOTHING runs until
+    /// you confirm. Deletion is always the recoverable Trash.
+    Do {
+        /// What to do, e.g. "trash all empty files" or "prefix each name with its created date"
+        #[arg(required = true)]
+        instruction: Vec<String>,
+        /// Operate within this folder (default: My Drive root)
+        #[arg(long = "in")]
+        folder: Option<String>,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Ask Claude a question, answered from your indexed files
     Prompt {
         /// What to ask
@@ -245,6 +262,9 @@ fn main() {
         }
         Command::Search { query, folder, limit } => {
             commands::search(account, &query.join(" "), folder.as_deref(), limit)
+        }
+        Command::Do { instruction, folder, yes } => {
+            commands::do_task(account, folder.as_deref(), &instruction.join(" "), yes)
         }
         Command::Prompt { question, folder, model } => {
             commands::prompt(account, &question.join(" "), folder.as_deref(), model.as_deref())

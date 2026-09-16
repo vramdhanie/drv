@@ -24,6 +24,8 @@ pub struct DriveFile {
     #[serde(default)]
     pub modified_time: Option<String>,
     #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
     pub parents: Option<Vec<String>>,
     #[serde(default)]
     pub web_view_link: Option<String>,
@@ -80,7 +82,7 @@ pub struct Drive {
 }
 
 const FILE_FIELDS: &str =
-    "id,name,mimeType,size,modifiedTime,parents,shared,shortcutDetails(targetId,targetMimeType)";
+    "id,name,mimeType,size,modifiedTime,createdTime,parents,shared,shortcutDetails(targetId,targetMimeType)";
 const INDEX_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLink";
 
 impl Drive {
@@ -160,7 +162,13 @@ impl Drive {
         if let Some(id) = path.strip_prefix("id:") {
             return self.get_file(id);
         }
-        let mut current = self.get_file("root")?;
+        let root = self.get_file("root")?;
+        self.resolve_from(root, path)
+    }
+
+    /// Resolve a slash path starting from an already-resolved base folder.
+    pub fn resolve_from(&self, base: DriveFile, path: &str) -> Result<DriveFile> {
+        let mut current = base;
         for segment in path.split('/').filter(|s| !s.is_empty()) {
             let escaped = segment.replace('\\', "\\\\").replace('\'', "\\'");
             let q = format!(
@@ -250,6 +258,19 @@ impl Drive {
             .json(&serde_json::Value::Object(body))
             .send()
             .context("moving file")?;
+        Ok(check(resp)?.json()?)
+    }
+
+    /// Create a folder inside a parent folder.
+    pub fn create_folder(&self, name: &str, parent_id: &str) -> Result<DriveFile> {
+        let resp = self
+            .http
+            .post(format!("{API}/files"))
+            .bearer_auth(self.bearer())
+            .query(&[("fields", FILE_FIELDS)])
+            .json(&json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id] }))
+            .send()
+            .context("creating folder")?;
         Ok(check(resp)?.json()?)
     }
 

@@ -193,6 +193,9 @@ enum Command {
         /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
+        /// Show the plan and stop — execute nothing
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
     },
     /// Ask Claude a question, answered from your indexed files
     Prompt {
@@ -284,8 +287,8 @@ fn main() {
         Command::Search { query, folder, limit } => {
             commands::search(account, &query.join(" "), folder.as_deref(), limit)
         }
-        Command::Do { instruction, folder, yes } => {
-            commands::do_task(account, folder.as_deref(), &instruction.join(" "), yes)
+        Command::Do { instruction, folder, yes, dry_run } => {
+            commands::do_task(account, folder.as_deref(), &instruction.join(" "), yes, dry_run)
         }
         Command::Prompt { question, folder, model } => {
             commands::prompt(account, &question.join(" "), folder.as_deref(), model.as_deref())

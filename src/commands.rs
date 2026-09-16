@@ -887,27 +887,41 @@ enum TaskStep {
     Mkdir { name: String, dest: Option<String> },
 }
 
-const DO_SYSTEM: &str = r#"You plan file operations on the user's Google Drive from a natural-language instruction. You are given the metadata listing of one folder (id, name, mimeType, size in bytes, modifiedTime, createdTime per item) and must respond with ONLY a JSON object — no prose, no markdown fences — of this shape:
+const DO_SYSTEM: &str = r#"You plan file operations on the user's Google Drive from a natural-language instruction. You are given metadata listings of one or more folders (id, name, mimeType, size in bytes, modifiedTime, createdTime per item), each labeled with its path. All paths anywhere are relative to the My Drive root (a leading '/' is fine). Respond with ONLY a JSON object — no prose, no markdown fences.
+
+If you need to see inside folders that are not yet listed (subfolders, or folders named in the instruction), respond with an exploration request and you will be called again with those listings added:
+
+{"explore": ["/Some Folder/Sub", ...], "notes": null}
+
+Once you can see everything the instruction requires, respond with the plan:
 
 {"steps": [ ... ], "notes": "one short sentence for the user, or null"}
 
-Allowed steps (use ONLY ids present in the listing):
+Allowed steps (use ONLY ids present in the provided listings):
   {"op":"rename","id":"...","new_name":"..."}
-  {"op":"move","id":"...","dest":"<folder path relative to the listed folder>"}
+  {"op":"move","id":"...","dest":"/path/of/destination/folder"}
   {"op":"copy","id":"...","new_name":null,"dest":null}            // file duplicate; folders cannot be copied
   {"op":"trash","id":"..."}                                       // recoverable; the ONLY form of deletion
   {"op":"share","id":"...","email":"...","role":"viewer|commenter|editor"}
   {"op":"download","id":"...","out":null}                         // out: local directory, default "."
-  {"op":"mkdir","name":"...","dest":null}                         // dest: parent path relative to the listed folder, null = the listed folder itself
+  {"op":"mkdir","name":"...","dest":null}                         // dest: parent folder path, null = the first listed folder
 
 Rules:
+- Explore before guessing: never plan against folders whose contents you have not seen. At most 20 paths per exploration request.
 - Steps run in order; a folder made by mkdir may be used as a later dest.
+- Moving a folder moves everything inside it — prefer moving one folder over moving its files individually when the instruction allows.
 - Only operate on items the instruction actually describes. When the instruction is ambiguous or matches nothing, return an empty steps array and explain in notes.
 - Never invent email addresses — share only with addresses given in the instruction.
 - You only have metadata. If the instruction needs file CONTENTS (e.g. a date printed inside a document), say so in notes and plan only what metadata supports.
 - At most 200 steps."#;
 
-pub fn do_task(account: Option<&str>, folder: Option<&str>, instruction: &str, yes: bool) -> Result<()> {
+pub fn do_task(
+    account: Option<&str>,
+    folder: Option<&str>,
+    instruction: &str,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
     let (_, drive) = connect(account)?;
     let scope = drive.resolve(folder.unwrap_or(""))?;
     if !scope.is_folder() {
@@ -920,46 +934,88 @@ pub fn do_task(account: Option<&str>, folder: Option<&str>, instruction: &str, y
             children.len()
         );
     }
-    let by_id: std::collections::HashMap<&str, &DriveFile> =
-        children.iter().map(|f| (f.id.as_str(), f)).collect();
+    // Explore-then-plan loop: Claude may request more folder listings
+    // before committing to a plan.
+    let mut gathered: Vec<(String, Vec<DriveFile>)> =
+        vec![(folder.unwrap_or("/").to_string(), children)];
+    let mut explore_errors: Vec<String> = Vec::new();
+    let mut plan: Option<TaskPlan> = None;
 
-    let listing = serde_json::to_string(
-        &children
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "id": f.id,
-                    "name": f.name,
-                    "mimeType": f.mime_type,
-                    "size": f.size_bytes(),
-                    "modifiedTime": f.modified_time,
-                    "createdTime": f.created_time,
-                })
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    for round in 0..5 {
+        let mut context = String::new();
+        for (path, files) in &gathered {
+            let listing = serde_json::to_string(
+                &files
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "id": f.id,
+                            "name": f.name,
+                            "mimeType": f.mime_type,
+                            "size": f.size_bytes(),
+                            "modifiedTime": f.modified_time,
+                            "createdTime": f.created_time,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            context.push_str(&format!("Folder '{path}' ({} items):\n{listing}\n\n", files.len()));
+        }
+        if !explore_errors.is_empty() {
+            context.push_str(&format!("Exploration errors: {}\n\n", explore_errors.join("; ")));
+        }
 
-    eprintln!("{}", "planning…".dimmed());
-    let raw = claude::ask(
-        DO_SYSTEM,
-        &format!(
-            "Folder: {}\nListing ({} items):\n{}\n\nInstruction: {}",
-            folder.unwrap_or("My Drive root"),
-            children.len(),
-            listing,
-            instruction
-        ),
-        None,
-    )?;
-    // Tolerate a fenced response despite instructions.
-    let raw = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let plan: TaskPlan = serde_json::from_str(raw)
-        .with_context(|| format!("could not parse the plan Claude returned:\n{raw}"))?;
+        eprintln!("{}", if round == 0 { "planning…" } else { "planning with explored folders…" }.dimmed());
+        let raw = claude::ask(DO_SYSTEM, &format!("{context}Instruction: {instruction}"), None)?;
+        // Tolerate a fenced response despite instructions.
+        let raw = raw
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .with_context(|| format!("could not parse Claude's response:\n{raw}"))?;
+
+        if let Some(paths) = value.get("explore").and_then(|e| e.as_array()) {
+            if round == 4 {
+                bail!("exploration did not converge on a plan after 5 rounds — try a more specific instruction");
+            }
+            for path in paths.iter().filter_map(|p| p.as_str()).take(20) {
+                if gathered.iter().any(|(p, _)| p == path) {
+                    continue;
+                }
+                eprintln!("{}", format!("  exploring {path}…").dimmed());
+                match drive.resolve(path) {
+                    Ok(f) if f.is_folder() => {
+                        let kids = drive.list_children(&f.id)?;
+                        gathered.push((path.to_string(), kids));
+                    }
+                    Ok(_) => explore_errors.push(format!("'{path}' is a file, not a folder")),
+                    Err(e) => explore_errors.push(format!("'{path}': {e:#}")),
+                }
+            }
+            let total: usize = gathered.iter().map(|(_, f)| f.len()).sum();
+            if total > 5000 {
+                bail!("explored listings exceed 5000 items — narrow the instruction");
+            }
+            continue;
+        }
+
+        plan = Some(
+            serde_json::from_value(value)
+                .with_context(|| format!("could not parse the plan Claude returned:\n{raw}"))?,
+        );
+        break;
+    }
+    let Some(plan) = plan else {
+        bail!("no plan produced");
+    };
+    let by_id: std::collections::HashMap<&str, &DriveFile> = gathered
+        .iter()
+        .flat_map(|(_, files)| files.iter())
+        .map(|f| (f.id.as_str(), f))
+        .collect();
 
     if let Some(notes) = &plan.notes {
         println!("{} {notes}", "note:".yellow());
@@ -1009,6 +1065,10 @@ pub fn do_task(account: Option<&str>, folder: Option<&str>, instruction: &str, y
         println!("  {:>3}. {line}", i + 1);
     }
 
+    if dry_run {
+        println!("{}", "dry run — nothing executed".dimmed());
+        return Ok(());
+    }
     if !yes {
         let go = dialoguer::Confirm::new()
             .with_prompt("Execute this plan?")
@@ -1020,10 +1080,10 @@ pub fn do_task(account: Option<&str>, folder: Option<&str>, instruction: &str, y
         }
     }
 
-    // Dest paths resolve relative to the scope folder at execution time, so
+    // Dest paths are root-relative and resolve at execution time, so
     // folders created by earlier mkdir steps are usable as destinations.
     let resolve_dest = |dest: &str| -> Result<DriveFile> {
-        let folder = drive.resolve_from(scope.clone(), dest)?;
+        let folder = drive.resolve(dest)?;
         if !folder.is_folder() {
             bail!("'{dest}' is not a folder");
         }

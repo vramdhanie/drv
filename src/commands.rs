@@ -244,6 +244,111 @@ fn print_entry(file: &DriveFile, long: bool, depth: usize) {
     }
 }
 
+// ---------- browse ----------
+
+/// Interactive Drive browser: arrow keys / type-to-filter to scroll,
+/// Enter opens a folder (or shows a file's details), ".." walks back up,
+/// Esc leaves. Shared items and shortcuts are marked.
+pub fn browse(account: Option<&str>) -> Result<()> {
+    let (_, drive) = connect(account)?;
+    let root = drive.get_file("root")?;
+    // Breadcrumb stack of (folder id, display name).
+    let mut stack: Vec<(String, String)> = vec![(root.id, "My Drive".into())];
+
+    loop {
+        let (current_id, _) = stack.last().cloned().unwrap();
+        let children = drive.list_children(&current_id)?;
+
+        let mut labels: Vec<String> = Vec::new();
+        if stack.len() > 1 {
+            labels.push("⬑ ..".into());
+        }
+        for f in &children {
+            let icon = if f.is_folder() {
+                "📁"
+            } else if f.is_shortcut() {
+                "🔗"
+            } else {
+                "· "
+            };
+            let mut label = format!("{icon} {}", f.name);
+            if f.is_shortcut() {
+                label.push_str("  (link — not stored here)");
+            }
+            if f.shared == Some(true) {
+                label.push_str("  (shared)");
+            }
+            labels.push(label);
+        }
+        if labels.is_empty() {
+            println!("{}", "(empty folder)".dimmed());
+            stack.pop();
+            if stack.is_empty() {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let breadcrumb: Vec<&str> = stack.iter().map(|(_, n)| n.as_str()).collect();
+        let prompt = format!(
+            "{}  {}",
+            breadcrumb.join(" / ").bold(),
+            "(type to filter · Enter to open · Esc to exit)".dimmed()
+        );
+        let picked = dialoguer::FuzzySelect::new()
+            .with_prompt(prompt)
+            .items(&labels)
+            .max_length(20)
+            .default(0)
+            .interact_opt()?;
+
+        let Some(picked) = picked else {
+            return Ok(()); // Esc
+        };
+
+        let has_up = stack.len() > 1;
+        if has_up && picked == 0 {
+            stack.pop();
+            continue;
+        }
+        let file = &children[picked - usize::from(has_up)];
+
+        if file.is_folder() {
+            stack.push((file.id.clone(), file.name.clone()));
+        } else if file.is_folder_shortcut() {
+            // Following a folder shortcut enters its target.
+            if let Some(target) = file.shortcut_details.as_ref().and_then(|d| d.target_id.clone()) {
+                stack.push((target, format!("{} ↗", file.name)));
+            }
+        } else {
+            // A file (or file shortcut): show its details and stay here.
+            let shown = if file.is_shortcut() {
+                // Describe the target, not the pointer.
+                match file.shortcut_details.as_ref().and_then(|d| d.target_id.as_deref()) {
+                    Some(target) => drive.get_file(target).unwrap_or_else(|_| file.clone()),
+                    None => file.clone(),
+                }
+            } else {
+                file.clone()
+            };
+            println!("\n  {}", file.name.bold());
+            if file.is_shortcut() {
+                println!("  {} this is a shortcut — the file itself lives elsewhere in Drive", "link:".yellow());
+            }
+            if file.shared == Some(true) {
+                println!("  {} shared", "sharing:".dimmed());
+            }
+            if let Some(size) = shown.size_bytes() {
+                println!("  {} {}", "size:".dimmed(), ui::human_size(size));
+            }
+            if let Some(modified) = shown.modified_time.as_deref() {
+                println!("  {} {}", "modified:".dimmed(), ui::short_time(modified));
+            }
+            println!("  {} id:{}\n", "id:".dimmed(), shown.id);
+        }
+    }
+}
+
 // ---------- share ----------
 
 pub fn share(account: Option<&str>, path: &str, email: &str, role: &str, notify: bool) -> Result<()> {

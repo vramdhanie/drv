@@ -48,6 +48,13 @@ enum Command {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    /// Browse your Drive interactively
+    ///
+    /// Starts at the root: scroll (or type to filter), Enter opens a
+    /// folder or shows a file's details, ".." walks back up, Esc exits.
+    /// Shared items and shortcuts (links to files stored elsewhere) are
+    /// labelled.
+    Browse,
     /// List files in a folder (root by default)
     Ls {
         /// Folder path, or "id:<fileId>"
@@ -219,6 +226,7 @@ fn main() {
             AccountCommand::List => commands::account_list(),
             AccountCommand::Use { alias } => commands::account_use(&alias),
         },
+        Command::Browse => commands::browse(account),
         Command::Ls { path, recursive, long } => {
             commands::ls(account, path.as_deref(), recursive, long)
         }

@@ -8,6 +8,7 @@ const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 
 /// (fileId, None) means the file was removed; Some carries the new state.
 pub type FileChange = (String, Option<DriveFile>);
@@ -26,11 +27,35 @@ pub struct DriveFile {
     pub parents: Option<Vec<String>>,
     #[serde(default)]
     pub web_view_link: Option<String>,
+    /// True when the item is shared (with the user, or by them to others).
+    #[serde(default)]
+    pub shared: Option<bool>,
+    /// Present only on shortcut items — pointers to a target elsewhere;
+    /// the item itself stores no content.
+    #[serde(default)]
+    pub shortcut_details: Option<ShortcutDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutDetails {
+    pub target_id: Option<String>,
+    pub target_mime_type: Option<String>,
 }
 
 impl DriveFile {
     pub fn is_folder(&self) -> bool {
         self.mime_type == FOLDER_MIME
+    }
+    pub fn is_shortcut(&self) -> bool {
+        self.mime_type == SHORTCUT_MIME
+    }
+    /// A shortcut whose target is a folder can be entered like one.
+    pub fn is_folder_shortcut(&self) -> bool {
+        self.shortcut_details
+            .as_ref()
+            .and_then(|d| d.target_mime_type.as_deref())
+            == Some(FOLDER_MIME)
     }
     pub fn size_bytes(&self) -> Option<u64> {
         self.size.as_deref().and_then(|s| s.parse().ok())
@@ -54,7 +79,8 @@ pub struct Drive {
     account: Option<String>,
 }
 
-const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents";
+const FILE_FIELDS: &str =
+    "id,name,mimeType,size,modifiedTime,parents,shared,shortcutDetails(targetId,targetMimeType)";
 const INDEX_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLink";
 
 impl Drive {

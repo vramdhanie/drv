@@ -12,6 +12,7 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 colored = "2"
+dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
 dirs = "5"
 fastembed = "6.1.0"
 indicatif = "0.17"

@@ -54,7 +54,7 @@ pub struct Drive {
     account: Option<String>,
 }
 
-const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime";
+const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents";
 const INDEX_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLink";
 
 impl Drive {
@@ -193,6 +193,37 @@ impl Drive {
             .json(&serde_json::Value::Object(body))
             .send()
             .context("copying file")?;
+        Ok(check(resp)?.json()?)
+    }
+
+    /// Move and/or rename a file or folder. Drive moves are re-parenting
+    /// operations: addParents/removeParents on an update call.
+    pub fn move_file(
+        &self,
+        file_id: &str,
+        add_parent: Option<&str>,
+        remove_parent: Option<&str>,
+        new_name: Option<&str>,
+    ) -> Result<DriveFile> {
+        let mut query: Vec<(&str, &str)> = vec![("fields", FILE_FIELDS)];
+        if let Some(p) = add_parent {
+            query.push(("addParents", p));
+        }
+        if let Some(p) = remove_parent {
+            query.push(("removeParents", p));
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = new_name {
+            body.insert("name".into(), json!(name));
+        }
+        let resp = self
+            .http
+            .patch(format!("{API}/files/{file_id}"))
+            .bearer_auth(self.bearer())
+            .query(&query)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .context("moving file")?;
         Ok(check(resp)?.json()?)
     }
 

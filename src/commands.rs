@@ -293,6 +293,57 @@ pub fn cp(account: Option<&str>, path: &str, new_name: Option<&str>, to: Option<
     Ok(())
 }
 
+// ---------- mv ----------
+
+pub fn mv(account: Option<&str>, source: &str, dest: &str) -> Result<()> {
+    let (_, drive) = connect(account)?;
+    let src = drive.resolve(source)?;
+    let current_parent = src.parents.as_ref().and_then(|p| p.first().cloned());
+
+    // Unix mv semantics: an existing folder destination means "move into
+    // it"; otherwise the last path segment is the new name.
+    let (target_folder, new_name): (Option<String>, Option<String>) = match drive.resolve(dest) {
+        Ok(d) if d.is_folder() => (Some(d.id), None),
+        Ok(d) => bail!(
+            "destination '{dest}' already exists as a file ({}) — pick a folder or a new name",
+            d.name
+        ),
+        Err(_) => {
+            let (parent_path, leaf) = match dest.rsplit_once('/') {
+                Some((parent, leaf)) => (parent.to_string(), leaf.to_string()),
+                None => (String::new(), dest.to_string()),
+            };
+            let parent = drive.resolve(&parent_path)?;
+            if !parent.is_folder() {
+                bail!("'{parent_path}' is not a folder");
+            }
+            (Some(parent.id), Some(leaf))
+        }
+    };
+
+    // Skip the re-parenting when the file is already in the target folder
+    // (pure rename) — Drive rejects addParents == existing parent politely,
+    // but there's no reason to send it.
+    let (add, remove) = match (&target_folder, &current_parent) {
+        (Some(t), Some(c)) if t == c => (None, None),
+        (Some(t), c) => (Some(t.as_str()), c.as_deref()),
+        (None, _) => (None, None),
+    };
+    if add.is_none() && new_name.is_none() {
+        bail!("'{source}' is already there");
+    }
+
+    let moved = drive.move_file(&src.id, add, remove, new_name.as_deref())?;
+    println!(
+        "{} moved {} → {} ({})",
+        "✓".green().bold(),
+        source.bold(),
+        dest.bold(),
+        format!("id:{}", moved.id).dimmed()
+    );
+    Ok(())
+}
+
 // ---------- upload ----------
 
 pub fn upload(account: Option<&str>, files: &[PathBuf], to: Option<&str>) -> Result<()> {

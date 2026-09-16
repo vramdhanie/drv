@@ -82,6 +82,18 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Move or rename a file or folder
+    ///
+    /// If DEST is an existing folder, SOURCE moves into it keeping its
+    /// name; otherwise the last path segment of DEST becomes the new name
+    /// (so `drv mv a/report.txt b/` moves, `drv mv report.txt draft.txt`
+    /// renames, and `drv mv a/x.txt b/y.txt` does both).
+    Mv {
+        /// File or folder to move, or "id:<fileId>"
+        source: String,
+        /// Destination folder or new path
+        dest: String,
+    },
     /// Upload one or more local files
     Upload {
         /// Local file paths
@@ -204,6 +216,7 @@ fn main() {
         Command::Cp { path, new_name, to } => {
             commands::cp(account, &path, new_name.as_deref(), to.as_deref())
         }
+        Command::Mv { source, dest } => commands::mv(account, &source, &dest),
         Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),
         Command::Download { paths, out } => commands::download(account, &paths, out.as_deref()),
         Command::Index { folders, all } => commands::index(account, &folders, all),

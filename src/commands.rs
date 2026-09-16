@@ -347,6 +347,23 @@ pub fn mv(account: Option<&str>, source: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------- rm ----------
+
+pub fn rm(account: Option<&str>, paths: &[String]) -> Result<()> {
+    let (_, drive) = connect(account)?;
+    for path in paths {
+        let file = drive.resolve(path)?;
+        drive.trash(&file.id)?;
+        println!(
+            "{} moved {} to Trash ({}) — recoverable at drive.google.com/drive/trash",
+            "✓".green().bold(),
+            file.name.bold(),
+            format!("id:{}", file.id).dimmed()
+        );
+    }
+    Ok(())
+}
+
 // ---------- upload ----------
 
 pub fn upload(account: Option<&str>, files: &[PathBuf], to: Option<&str>) -> Result<()> {

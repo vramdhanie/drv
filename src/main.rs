@@ -94,6 +94,12 @@ enum Command {
         /// Destination folder or new path
         dest: String,
     },
+    /// Move files or folders to the Trash (never permanently deletes)
+    Rm {
+        /// Drive paths, or "id:<fileId>"
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Upload one or more local files
     Upload {
         /// Local file paths
@@ -217,6 +223,7 @@ fn main() {
             commands::cp(account, &path, new_name.as_deref(), to.as_deref())
         }
         Command::Mv { source, dest } => commands::mv(account, &source, &dest),
+        Command::Rm { paths } => commands::rm(account, &paths),
         Command::Upload { files, to } => commands::upload(account, &files, to.as_deref()),
         Command::Download { paths, out } => commands::download(account, &paths, out.as_deref()),
         Command::Index { folders, all } => commands::index(account, &folders, all),

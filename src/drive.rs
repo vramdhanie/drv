@@ -227,6 +227,20 @@ impl Drive {
         Ok(check(resp)?.json()?)
     }
 
+    /// Move a file or folder to the Trash (recoverable for ~30 days).
+    /// drv never permanently deletes.
+    pub fn trash(&self, file_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .patch(format!("{API}/files/{file_id}"))
+            .bearer_auth(self.bearer())
+            .json(&json!({ "trashed": true }))
+            .send()
+            .context("trashing file")?;
+        check(resp)?;
+        Ok(())
+    }
+
     /// Resumable upload: initiate with metadata, then PUT the bytes.
     pub fn upload(
         &self,

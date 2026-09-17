@@ -16,7 +16,11 @@ $ drv ls Projects --long
 $ drv share "Projects/notes.md" someone@example.com --role editor
 $ drv upload report.pdf photo.jpg --to "Projects/Archive"
 $ drv download "Projects/notes.md" --out ~/Desktop
-$ drv index
+$ drv mv "Inbox/report.pdf" "Projects/Archive/"
+$ drv cat "Projects/notes.md"
+$ drv vim "Projects/notes.md"
+$ drv do "find all empty files in this folder and delete them" --in Projects
+$ drv index --in "Baha'i" --in MSc
 $ drv search "the contract that mentions early termination fees"
 $ drv prompt --in "Projects" "what did we decide about the launch date?"
 ```
@@ -97,14 +101,39 @@ Each account keeps its own Keychain tokens and its own local search index.
 | `drv cp PATH [NEW_NAME] [--to FOLDER]` | Server-side duplicate |
 | `drv upload FILE... [--to FOLDER]` | Upload with progress bars |
 | `drv download PATH... [--out DIR]` | Download; Google-native docs export to docx/xlsx/pptx |
-| `drv index` | Build/refresh the local semantic index |
+| `drv mv SOURCE DEST` | Move and/or rename (folder dest moves into it; new leaf renames) |
+| `drv rm PATH...` | Move to Trash — never a permanent delete |
+| `drv cat PATH` | Print contents; Docs/Sheets export as text/CSV, binary streams when redirected |
+| `drv edit PATH` (alias `vim`) | Edit in $EDITOR, saved back to Drive only if changed |
+| `drv browse` | Interactive browser: fuzzy navigation, multi-select + actions, shared/link markers |
+| `drv do "INSTRUCTION" [--in FOLDER] [--dry-run]` | Natural-language tasks: plan shown, run on confirm |
+| `drv index [--in FOLDER]... [--threads N] [--max-mem GB]` | Build/refresh the local semantic index |
 | `drv search QUERY [--in FOLDER] [-n N]` | Semantic search over indexed content |
 | `drv prompt QUESTION [--in FOLDER]` | Ask Claude, answered from your files with citations |
 | `drv account list` / `use ALIAS` | Manage multiple Google accounts |
-| `drv auth claude` | Store an Anthropic API key for `prompt` |
+| `drv auth claude` | Store an Anthropic API key (optional — see below) |
 
 Paths are resolved from your Drive root (`"Projects/Notes/todo.txt"`); use
 `id:<fileId>` anywhere a path is accepted to address a file directly.
+
+## Natural-language tasks
+
+`drv do` turns an instruction — *"consolidate '/Personal - NEW/Nirav' into
+'/Personal Home/Nirav'"*, *"prefix each file here with its created date"* —
+into a concrete plan over a safe vocabulary (rename, move, copy, share,
+download, trash, new folders). Claude explores folders it needs to see,
+then the full plan is printed and **nothing runs until you confirm**
+(`--dry-run` to only look, `--yes` to skip the prompt). Deletion only ever
+means the recoverable Trash, and plans can only touch items in the folders
+that were actually listed.
+
+## Interactive browsing
+
+`drv browse` starts at your Drive root: type to fuzzy-filter, Enter opens a
+folder, `..` walks up, Esc leaves. Shared items are marked, and shortcuts
+are labelled as links whose content lives elsewhere. `select multiple…`
+ticks a set of files for a batch action — download, share, move (with an
+interactive destination picker), or trash.
 
 ## How the semantic index works
 
@@ -115,11 +144,19 @@ text-like files, chunks it, and embeds each chunk with a **local** embedding
 model (BGE-small, ~130 MB, downloaded once to `~/Library/Caches/drv`). The
 index lives in SQLite under your data directory, one per account.
 
+Indexing is scoped: name the folders whose *content* is worth embedding
+with `drv index --in <folder>` (repeatable; the choice persists; `--all`
+clears it). Without roots, only Google-native docs and PDFs are taken
+drive-wide. The indexer runs at background priority with capped embedding
+threads (`--threads`, default 2) and exits cleanly past a memory ceiling
+(`--max-mem`, default 3 GB) — progress is saved and the next run resumes.
+
 Your file contents are sent nowhere: embedding runs on-device, and search
-(`drv search`) works entirely offline. Only `drv prompt` makes an external
-call — it sends your question plus the dozen most relevant excerpts to the
-Claude API (default model `claude-opus-5`, override with `--model`) and
-prints an answer with numbered citations back to your files.
+(`drv search`) works entirely offline. Only `drv prompt` and `drv do` call
+Claude — with your stored API key, or, when none is set, through your
+locally installed **Claude Code CLI** (`claude -p`), riding your existing
+subscription with no key at all. `--model` passes through to either
+backend.
 
 ## Roadmap
 

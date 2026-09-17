@@ -1,10 +1,11 @@
 [package]
 name = "drv"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A fast CLI for managing your Google Drive"
 license = "MIT"
 repository = "https://github.com/vramdhanie/drv"
+homepage = "https://github.com/vramdhanie/drv"
 rust-version = "1.82"
 
 [dependencies]
@@ -33,3 +34,8 @@ urlencoding = "2"
 [profile.release]
 lto = true
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

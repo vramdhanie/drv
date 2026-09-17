@@ -23,7 +23,11 @@ $ drv prompt --in "Projects" "what did we decide about the launch date?"
 
 ## Install
 
-Homebrew distribution is planned. For now, build from source:
+```bash
+brew install vramdhanie/tap/drv
+```
+
+Or build from source:
 
 ```bash
 make install     # cargo install + code-sign (falls back to unsigned)
@@ -119,8 +123,7 @@ prints an answer with numbered citations back to your files.
 
 ## Roadmap
 
-- **v0.3** — Homebrew tap (`brew install vramdhanie/tap/drv`), recursive
-  download/upload of folders, indexing of docx/xlsx uploads.
+- Recursive download/upload of folders; indexing of docx/xlsx uploads.
 
 ## License
 

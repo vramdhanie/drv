@@ -26,8 +26,15 @@ $ drv prompt --in "Projects" "what did we decide about the launch date?"
 Homebrew distribution is planned. For now, build from source:
 
 ```bash
-cargo install --path .
+make install     # cargo install + code-sign (falls back to unsigned)
 ```
+
+`make install` signs the binary with a local self-signed certificate
+(`drv-signing`) when one exists, so macOS Keychain "Always Allow"
+approvals survive rebuilds — an unsigned binary gets a new identity on
+every build and re-prompts. One-time setup: in Keychain Access, create
+a Self-Signed Root certificate of type Code Signing named `drv-signing`
+and set its Code Signing trust to Always Trust.
 
 ## Authentication
 

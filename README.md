@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/github/license/vramdhanie/drv?color=green)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-DEA584?logo=rust)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-macOS-black?logo=apple)](https://github.com/vramdhanie/drv)
+[![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-black?logo=apple)](https://github.com/vramdhanie/drv)
 
 A fast command-line manager for Google Drive. List, share, copy, upload, and
 download from the terminal; index your Drive's contents with a local

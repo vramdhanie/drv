@@ -10,8 +10,10 @@ ci = "github"
 # The installers to generate for each app
 installers = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
-# macOS only: drv depends on the Keychain and other Darwin APIs.
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# Apple Silicon macOS only: drv depends on the Keychain and other Darwin
+# APIs, and ort (ONNX Runtime, via fastembed) ships no prebuilt binaries
+# for x86_64-apple-darwin.
+targets = ["aarch64-apple-darwin"]
 # Publish the formula to the personal tap on each release
 tap = "vramdhanie/homebrew-tap"
 publish-jobs = ["homebrew"]
